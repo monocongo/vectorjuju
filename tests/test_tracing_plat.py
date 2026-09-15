@@ -45,38 +45,54 @@ def point_segment_distance(points: np.ndarray, a: np.ndarray, b: np.ndarray) -> 
 
 def edge_hits(
     runs: list[Run], a: np.ndarray, b: np.ndarray, *, tolerance: float = 3.0, endpoint_px: float = 8.0
-) -> list[np.ndarray]:
-    """Runs whose interior lies within tolerance of segment ab."""
+) -> list[tuple[np.ndarray, bool]]:
+    """Runs substantially inside the tolerance band of ab, as (points, entire interior inside).
+
+    A run counts as a hit once half its interior samples are in the band, so a
+    second entity that only partly parallels the edge is still counted; the
+    boolean reports whether that run stays inside for its whole interior.
+    """
     hits = []
     for run in runs:
         points = densify(run.points_px)
         distance = point_segment_distance(points, a, b)
         to_endpoint = np.minimum(np.hypot(*(points - a).T), np.hypot(*(points - b).T))
         interior = to_endpoint > endpoint_px  # the 8 px corner-splitting slop
-        if interior.sum() >= 3 and np.all(distance[interior] <= tolerance):
-            hits.append(points)
+        if interior.sum() < 3:
+            continue
+        in_band = distance[interior] <= tolerance
+        if in_band.mean() >= 0.5:
+            hits.append((points, bool(in_band.all())))
     return hits
 
 
-@pytest.mark.parametrize("segment_id", ["S0", "S1", "S3", "S5"])
-def test_exactly_one_run_per_straight_edge(plat: tuple[list[Run], dict], segment_id: str):
+def test_exactly_one_run_per_straight_edge(plat: tuple[list[Run], dict]):
     runs, truth = plat
-    segment = next(s for s in truth["segments"] if s["id"] == segment_id)
-    a, b = to_px(segment["start_pt"]), to_px(segment["end_pt"])
+    straight = [segment for segment in truth["segments"] if segment["kind"] == "straight"]
+    assert len(straight) == 4  # the fixture plants four straight edges
 
-    hits = edge_hits(runs, a, b)
-
-    assert len(hits) == 1, f"{segment_id}: {len(hits)} runs within 3 px"
-    points = hits[0]
-    for end in (points[0], points[-1]):
-        assert min(np.hypot(*(end - a)), np.hypot(*(end - b))) <= 8.0
+    for segment in straight:
+        a, b = to_px(segment["start_pt"]), to_px(segment["end_pt"])
+        hits = edge_hits(runs, a, b)
+        assert len(hits) == 1, f"{segment['id']}: {len(hits)} runs within 3 px"
+        points, inside = hits[0]
+        assert inside, f"{segment['id']}: run leaves the 3 px band"
+        for end in (points[0], points[-1]):
+            assert min(np.hypot(*(end - a)), np.hypot(*(end - b))) <= 8.0
 
 
 def test_no_primitive_on_offset_lines(plat: tuple[list[Run], dict]):
     runs, truth = plat
+    assert runs
+    assert truth["offset_lines"]
 
     for line in truth["offset_lines"]:
         a, b = to_px(line["start_pt"]), to_px(line["end_pt"])
         for run in runs:
-            distance = point_segment_distance(densify(run.points_px), a, b)
-            assert float(np.median(distance)) > 3.0, f"{line['id']} traced as geometry"
+            points = densify(run.points_px)
+            distance = point_segment_distance(points, a, b)
+            to_endpoint = np.minimum(np.hypot(*(points - a).T), np.hypot(*(points - b).T))
+            interior = to_endpoint > 8.0  # the same endpoint slop A7 allows the boundary runs
+            if interior.sum() == 0:
+                continue
+            assert np.all(distance[interior] > 3.0), f"{line['id']} traced as geometry"
