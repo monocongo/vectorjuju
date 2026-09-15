@@ -18,6 +18,7 @@ import pypdfium2 as pdfium
 from PIL import Image, ImageOps
 
 RASTER_SUFFIXES = frozenset({".jpg", ".jpeg", ".tif", ".tiff"})
+_RASTER_FORMATS = frozenset({"JPEG", "MPO", "TIFF"})
 _PDF_SUFFIX = ".pdf"
 
 
@@ -83,6 +84,8 @@ def _load_pdf(path: Path, dpi: int) -> Image.Image:
 def _load_image(path: Path) -> Image.Image:
     try:
         with Image.open(path) as image:
+            if image.format not in _RASTER_FORMATS:
+                raise UnsupportedInputError(f"expected a JPG or TIFF, decoded {image.format}: {path.name}")
             frames = getattr(image, "n_frames", 1)
             if frames != 1:
                 raise UnsupportedInputError(f"image must have exactly one frame, found {frames}: {path.name}")

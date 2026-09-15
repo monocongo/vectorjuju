@@ -38,6 +38,7 @@ def bad_inputs(tmp_path_factory: pytest.TempPathFactory) -> Path:
     first, second = Image.new("RGB", (8, 8), "white"), Image.new("RGB", (8, 8), "black")
     first.save(out / "two_frame.tif", save_all=True, append_images=[second])
     pdfium.PdfDocument.new().save(str(out / "zero_page.pdf"))
+    Image.new("RGB", (8, 8), "white").save(out / "mislabeled.jpg", format="PNG")
     return out
 
 
@@ -96,6 +97,7 @@ def test_zero_dpi_raises_unsupported_input_error_instead_of_leaking(sheet: Path)
         "two_page.pdf",
         "two_frame.tif",
         "zero_page.pdf",
+        "mislabeled.jpg",
     ],
 )
 def test_unsupported_inputs_raise_and_write_nothing(bad_inputs: Path, media: str) -> None:
