@@ -85,7 +85,7 @@ a pure function lives here.
 | U1 | Transform | `px_to_cad(cad_to_px(p))` round trip; origin flip (top of raster → large CAD y) | ≤ 1e-6, 2 DPI × 2 fpp |
 | U2 | Calibration | Planted call distances vs planted pixel lengths recover `fpp` | relative error ≤ 1 % |
 | U3 | Classification | Planted 48-vertex arc → `curve` + circle fit; L-corner → `line`; 3 px stroke traces one centreline; glyph raster yields zero primitives; dashed run merges to one; same figure at 2 DPIs gives the same count | prior-art gates, carried |
-| U4 | DXF contract | `$ACADVER` AC1015; `$INSUNITS` 21 / 2 / 6 per `units`; the three layers exist and every entity sits on one of them, with the writer's mandatory `0` and `Defpoints` layers empty; fitted curve emits `ARC`; MTEXT rotation ∈ (-90, 90]; no XDATA and no APPID referenced by any entity (the DXF-mandated `ACAD` APPID stays in the table); reopen audit error list empty; per-layer counts match sidecar; sidecar keys/types match the contract schema; two writes byte-identical | exact |
+| U4 | DXF contract | `$ACADVER` AC1015; `$INSUNITS` 21 / 2 / 6 per `units`; the three layers exist and every entity sits on one of them, with the writer's mandatory `0` and `Defpoints` layers empty; fitted curve emits `ARC`; MTEXT rotation ∈ (-90, 90]; no XDATA and no APPID referenced by any entity (the DXF-mandated `ACAD` APPID stays in the table); reopen audit error list empty; per-layer counts match sidecar; sidecar keys/types match the sidecar schema settled in [issue #5](https://github.com/monocongo/vectorjuju/issues/5) (`units`, `scale`, `dpi`, `entities[]`, `unbound_text`) — the prior-art `spatial_graph` shape is superseded; two writes byte-identical | exact |
 | U5 | Parsing and binding | Parser table incl. unit-mark variants and non-calls (`PARCEL 5`, `LOT 12`); a planted call beside a 10 pt-parallel offset line binds to the planted line; off-gate text lands in `unbound_text`, never force-bound | exact |
 
 ## Acceptance gates — full `convert()` per media
@@ -100,10 +100,10 @@ comparison of a file with itself.
 | # | Gate | Assertion | Tolerance |
 |---|---|---|---|
 | A1 | Scale | `sidecar.scale.value` vs planted `fpp`; `method == "ransac"`; with `scale=` override `method == "override"` | ≤ 1 % / ≤ 1e-9 |
-| A2 | Calls bound | Each of the 4 planted straight calls appears exactly once in a sidecar `entities[].label` of type `line`; its interior vertices lie within 3 px of the planted segment and its two extreme vertices reach within 8 px of that segment's endpoints — the corner-splitting slop A7 uses, which replaces the 3 px bound at the ends; text passes the fidelity rule above | as derived |
-| A3 | Distractors | No label-carrying entity lies within 3 px of either planted offset line; no string from `ground_truth["distractor_text"]`, no title-block text (a class the fixture must add to `distractor_text`, including `SCALE: 1" = 100'`), and no `curve_table_cells` value other than `C1`/`C2` bound to its own arc appears in any `entities[].label` — `unbound_text` is fine | 3 px, exact |
-| A4 | True arcs | Exactly 2 `ARC` on `BOUNDARY_CURVE`, 0 `SPLINE` (the fixture's arcs are clean circles), no dense polyline standing in; each planted curve ref `C1`/`C2` appears exactly once in an `entities[].label` on its planted curve entity; radius vs planted `radius_ft`; endpoints vs planted chord endpoints; ARC midpoint vs the planted curve label anchor (proves bulge side) | ≤ 3 % / ≤ 4 px / ≤ 8 px |
-| A5 | Units | Default run: `$INSUNITS == 21`, `doc.units == 21`, `sidecar.units == "us-survey-foot"`; `international-foot` variant → 2; `metre` variant → 6, `sidecar.scale.value` vs `fpp_m` and every CAD coordinate in metres | exact / ≤ 1 % on the scale |
+| A2 | Calls bound | Each of the 4 planted straight calls appears exactly once as the `label.raw_text` of a `type: line` sidecar `entities[]` entry; its interior vertices lie within 3 px of the planted segment and its two extreme vertices reach within 8 px of that segment's endpoints — the corner-splitting slop A7 uses, which replaces the 3 px bound at the ends; text passes the fidelity rule above | as derived |
+| A3 | Distractors | No label-carrying entity lies within 3 px of either planted offset line; no string from `ground_truth["distractor_text"]`, no title-block text (a class the fixture must add to `distractor_text`, including `SCALE: 1" = 100'`), and no `curve_table_cells` value appears in any `entities[].label.raw_text` except the `C1`/`C2` cells, which are textually identical to the planted on-curve curve labels — A4's insertion check is what proves the on-curve label was read rather than the table cell; `unbound_text` is fine | 3 px, exact |
+| A4 | True arcs | Exactly 2 `ARC` on `BOUNDARY_CURVE`, 0 `SPLINE` (the fixture's arcs are clean circles), no dense polyline standing in; each planted curve ref `C1`/`C2` appears exactly once as the `label.raw_text` on its planted curve entity, with that label's insertion within 20 px of the curve-ref label's planted `quad_pt` (inside = 0) — the table cell carrying the same text sits far away, so this is what distinguishes an on-curve read from the table cell; radius vs planted `radius_ft`; endpoints vs planted chord endpoints; ARC midpoint vs the planted curve label anchor (proves bulge side) | 20 px / ≤ 3 % / ≤ 4 px / ≤ 8 px |
+| A5 | Units | Default run: `$INSUNITS == 21` (`doc.units` reads that same header var back), `sidecar.units == "us-survey-foot"`; `international-foot` variant → 2; `metre` variant → 6, `sidecar.scale.value` vs `fpp_m` and every CAD coordinate in metres | exact / ≤ 1 % on the scale |
 | A6 | Labels | Every rotation ∈ (-90, 90]; each straight call's rotation within 5° of its planted `rotation_deg` (already normalised, so it is the same whichever way the run was traced) — the bucket follows, and a mirror of a non-flat label fails where a magnitude-only bucket test would pass it; insertion within 20 px of the planted text box `quad_pt` (inside = 0) | exact / 5° / 20 px |
 | A7 | Run continuity | Per planted straight edge, exactly one `LWPOLYLINE` runs within 3 px of it, its two extreme vertices reach within 8 px of the edge's endpoints, and no second parallel entity runs within 3 px (double-edge regression) | 3 px / 8 px |
 | A8 | Determinism | Two runs on one input produce identical DXF bytes and identical JSON bytes | exact |
@@ -187,9 +187,10 @@ the file itself ever reported.
 5. Hand-verify 3–5 printed distances against measured DXF lengths (≤ 2 %) and
    the curve-table radii against fitted ARC radii (≤ 5 %); count labels bound
    vs unbound.
-6. Report only aggregates: sha256 prefix, pixel size, layer/entity counts,
-   bound/unbound label counts, failure categories — with the temp dir already
-   gone before anything is reported.
+6. Report only aggregates: pixel size, layer/entity counts, bound/unbound
+   label counts, failure categories. No content-derived identifier of the
+   source — a hash prefix lets anyone holding a candidate copy confirm it was
+   the file used — with the temp dir already gone before anything is reported.
 7. Failures (uncalibratable, unreadable) are reported by category, not
    skipped silently.
 
