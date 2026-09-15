@@ -38,9 +38,9 @@ every CAD-space gate compares metres. The sheet, its three media, and
 scope — generated, never committed ([Port the synthetic plat sheet
 generator](https://github.com/monocongo/vectorjuju/issues/6)).
 
-Planted counts: 6 parcel edges (4 straight calls, 2 curve refs), 2 parallel
-right-of-way offset lines, a 3-row curve table (header plus `C1`/`C2`),
-monuments, north arrow, scale bar, title block.
+Planted counts: 6 parcel edges (4 straight calls, 2 curve refs, no two
+straight edges collinear), 2 parallel right-of-way offset lines, a 3-row curve
+table (header plus `C1`/`C2`), monuments, north arrow, scale bar, title block.
 
 ## Gate tolerances
 
@@ -58,8 +58,8 @@ Thresholds are derived, not tuned:
   that don't fit a circle, and the fixture plants none.
 - **5°** on label rotation: trace-direction jitter (~1° for 2 px over a 100 px
   run) has to pass, and the magnitude-only buckets cannot reject a mirrored
-  label; 5° does, except on the flat ~2° edge, where a mirror sits inside the
-  jitter band and only the overlay catches it.
+  label; 5° does, except on the flat ~2° edge, where the mirror is inside the
+  jitter band and harmless anyway — text reads left-to-right at either sign.
 - **20 px** label insertion is the distance from the emitted insertion point to
   the planted text box `quad_pt`, inside the box counting as zero — that
   absorbs OCR box drift and any corner-versus-centre convention, and the
@@ -69,8 +69,8 @@ Thresholds are derived, not tuned:
 Label text fidelity reuses the classification from the throwaway
 `prototypes/diagonal_call_labels.py` (`text_only` etc.) — criteria, not its
 code: a read passes if its verdict is `exact` or `normalized`, or `text_only`
-with no unit mark gained or swapped, i.e. `mark_counts(recovered)` is
-`mark_counts(truth)` with marks only ever missing. Lost unit-mark punctuation
+with no unit mark gained or swapped — for each mark, `count(recovered) <=
+count(truth)`. Lost unit-mark punctuation
 (`'` `"` `°`) is tolerated; a wrong digit, letter, dropped `.`, or a `200.16'`
 read as `200.16"` — a 12× unit error the bare `text_only` verdict would wave
 through — is not.
@@ -151,8 +151,8 @@ Only properties of the full input→DXF path are acceptance gates.
 CI, every PR:
 
 - Unit gates in the existing job, which becomes `pytest -m "not acceptance"`
-  (marker registered in `pyproject.toml`) so the OCR path runs once, in the
-  acceptance job.
+  (add the `acceptance` marker to `pyproject.toml`'s
+  `[tool.pytest.ini_options]`) so the OCR path runs once, in the acceptance job.
 - A dedicated `acceptance` job (ubuntu-latest) running `pytest -m acceptance`
   over all three media plus the failure paths. Sheet generated once per
   session (~2 s), one `convert()` per medium, docling model cache keyed to the
