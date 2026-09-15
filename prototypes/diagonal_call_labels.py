@@ -59,6 +59,7 @@ import shutil
 import subprocess
 import tempfile
 import unicodedata
+from functools import lru_cache
 from pathlib import Path
 
 from PIL import Image
@@ -148,9 +149,9 @@ def fold180(a: float) -> float:
 
 def quad_to_px(quad_pt, gt: dict, px_size) -> list[tuple[float, float]]:
     """Planted quads are PDF points, bottom-left origin; rasters are top-left."""
-    sx = px_size[0] / gt["page_size_pt"][0]
+    sx, sy = px_size[0] / gt["page_size_pt"][0], px_size[1] / gt["page_size_pt"][1]
     ph = gt["page_size_pt"][1]
-    return [(x * sx, (ph - y) * sx) for x, y in quad_pt]
+    return [(x * sx, (ph - y) * sy) for x, y in quad_pt]
 
 
 def load_raster(path: Path) -> tuple[Image.Image, dict]:
@@ -220,9 +221,9 @@ def warp_band(img: Image.Image, seg, center, half_len: float, half_h: float) -> 
     ]
     dst = [(0.0, 0.0), (float(w), 0.0), (0.0, float(h))]
     m = cv2.getAffineTransform(np.float32(src), np.float32(dst))
-    warped = cv2.warpAffine(
-        np.asarray(img.convert("RGB")), m, (w, h), flags=cv2.INTER_CUBIC, borderValue=(255, 255, 255)
-    )
+    # load_raster already returned RGB: convert("RGB") copies the whole raster, ~11MB
+    # per crop on the synthetic sheet, to sample one band out of it.
+    warped = cv2.warpAffine(np.asarray(img), m, (w, h), flags=cv2.INTER_CUBIC, borderValue=(255, 255, 255))
     return Image.fromarray(warped)
 
 
@@ -248,6 +249,13 @@ def tesseract_bin() -> str | None:
     return shutil.which("tesseract")
 
 
+@lru_cache(maxsize=1)
+def tesseract_version(exe: str) -> str:
+    """Once per process: one version spawn per OCR call is pure overhead."""
+    out = subprocess.run([exe, "--version"], capture_output=True, check=False).stdout.decode("utf-8", "replace")
+    return out.splitlines()[0].strip() if out.strip() else "tesseract"
+
+
 def ocr_tesseract(png_path: Path, psm: int) -> dict:
     exe = tesseract_bin()
     if not exe:
@@ -261,7 +269,7 @@ def ocr_tesseract(png_path: Path, psm: int) -> dict:
     idx = {k: header.index(k) for k in keys}
     items = []
     for r in data:
-        if len(r) <= idx["text"]:
+        if len(r) <= max(idx.values()):  # short row: header drift or truncated output
             continue
         text, conf = r[idx["text"]].strip(), float(r[idx["conf"]])
         if not text or conf < 0:
@@ -275,14 +283,10 @@ def ocr_tesseract(png_path: Path, psm: int) -> dict:
                 "line_key": (int(r[idx["block_num"]]), int(r[idx["par_num"]]), int(r[idx["line_num"]])),
             }
         )
-    version = (
-        subprocess.run([exe, "--version"], capture_output=True, check=False)
-        .stdout.decode("utf-8", "replace")
-        .splitlines()
-    )
+    version = tesseract_version(exe)
     return {
         "available": True,
-        "engine": version[0] if version else "tesseract",
+        "engine": version,
         "config": f"--psm {psm} tsv",
         "text": " ".join(it["text"] for it in items),
         "items": items,
@@ -372,11 +376,13 @@ def ocr_docling(png_path: Path) -> dict:
     }
 
 
-def ocr_image(eng: str, pil: Image.Image, path: Path) -> dict:
+def ocr_image(eng: str, pil: Image.Image, workdir: Path, tag: str) -> dict:
+    """Only the engines that take a file get one written. ocrmac reads the PIL
+    image, and every PNG saved is another crop on disk in private mode."""
     if eng == "docling":
-        return ocr_docling(path)
+        return ocr_docling(save_png(pil, workdir / f"{tag}.png"))
     if eng == "tesseract":
-        return ocr_tesseract(path, CROP_PSM)
+        return ocr_tesseract(save_png(pil, workdir / f"{tag}.png"), CROP_PSM)
     return ocr_ocrmac(pil)
 
 
@@ -387,7 +393,7 @@ def ocr_crop(eng: str, crop: Image.Image, workdir: Path, tag: str) -> dict:
     classifier instead of OCRing every crop twice."""
     best = None
     for suffix, image in (("", crop), ("-rot180", crop.rotate(180))):
-        res = ocr_image(eng, image, save_png(image, workdir / f"{tag}{suffix}.png"))
+        res = ocr_image(eng, image, workdir, f"{tag}{suffix}")
         if not res.get("available"):
             return res
         if best is None or len(alnum_text(res["text"])) > len(alnum_text(best["text"])):
@@ -557,7 +563,9 @@ def run_private(path: Path, engine_names: list[str], max_crops: int) -> None:
 
     with tempfile.TemporaryDirectory(prefix="vj8-priv-") as tmp:
         workdir = Path(tmp)
-        page_img = save_png(img, workdir / "page.png")
+        # Only the tesseract locator needs a file, and writing the whole sheet is
+        # the one artifact here that is not a small crop of it.
+        page_img = save_png(img, workdir / "page.png") if "tesseract" in engine_names else None
         candidates: list[dict] = []
         for eng in ("ocrmac", "tesseract"):  # page OCR only *locates* candidates; docling is a crop engine here
             if eng not in engine_names:
@@ -588,9 +596,12 @@ def run_private(path: Path, engine_names: list[str], max_crops: int) -> None:
             return
         # A label crop is small relative to the sheet; anything page-sized is a
         # locator failure (a merged region), not a label.
-        page_w, page_h = px_size
+        page_w = px_size[0]
+        # Width alone rejects a merged page-sized region. A height cap cannot: a
+        # label on a steep line has a tall axis-aligned box (183px and 203px of
+        # 2200 on the synthetic sheet), so capping height drops exactly the
+        # diagonal calls this prototype exists to measure.
         plausible = [c for c in candidates if c["box_px"][2] - c["box_px"][0] <= 0.3 * page_w]
-        plausible = [c for c in plausible if c["box_px"][3] - c["box_px"][1] <= 0.06 * page_h]
         if len(plausible) != len(candidates):
             print(f"dropped {len(candidates) - len(plausible)} implausible (page-sized) candidates")
         candidates = plausible[:max_crops]
