@@ -36,11 +36,10 @@ _DASH_ANGLE_DEG = 12.0
 _DASH_COLLINEAR_PX = 1.5
 _SIMPLIFY_PX = 1.5
 _CORNER_DEG = 15.0
-_SHARP_CORNER_DEG = 45.0
-_CORNER_ISOLATION = 3.0
 _JOIN_DEG = 75.0
 _DUPLICATE_PX = 2.0
 _WIDTH_STEP_PX = 0.1
+_MAX_INDEX_CELLS = 4096
 
 _OFFSETS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 
@@ -64,8 +63,8 @@ def trace_runs(
     is a boolean array the size of the raster; true pixels are removed before
     tracing (text boxes go here once OCR lands).
     """
-    if dpi <= 0:
-        raise ValueError(f"dpi must be positive, got {dpi!r}")
+    if not np.isfinite(dpi) or dpi <= 0:
+        raise ValueError(f"dpi must be a positive finite number, got {dpi!r}")
     if isinstance(image, Image.Image):
         gray = np.asarray(image.convert("L"))
     else:
@@ -74,14 +73,18 @@ def trace_runs(
             raise ValueError(f"image array must be 2-D uint8 grayscale, got shape {gray.shape} dtype {gray.dtype}")
     if gray.size == 0:
         return []
-    if exclude_mask is not None and exclude_mask.shape != gray.shape:
-        raise ValueError(f"exclude_mask shape {exclude_mask.shape} does not match image shape {gray.shape}")
+    if exclude_mask is not None:
+        exclude_mask = np.asarray(exclude_mask)
+        if exclude_mask.shape != gray.shape:
+            raise ValueError(f"exclude_mask shape {exclude_mask.shape} does not match image shape {gray.shape}")
     mask = exclude_mask.astype(bool) if exclude_mask is not None else None
     binary = _binarize(gray)
     if mask is not None:
         binary &= ~mask
-    if not binary.any() or binary.all():
-        return []  # nothing to trace, or a solid page that has no centreline to thin to
+    # Nothing to trace; a near-solid page is a scan of something other than
+    # linework, and thinning it costs minutes of CPU for no centreline.
+    if not binary.any() or binary.mean() > 0.7:
+        return []
     # Ink coverage, not a binary width: anti-aliasing quantises px counts, but
     # the integrated coverage of a cross-section is the true stroke width.
     coverage = (255.0 - gray.astype(np.float32)) / 255.0
@@ -311,8 +314,9 @@ def _merge_dashes(
     Candidate pairs come from an endpoint grid, and the tightest collinear gap
     is merged first, so a dash chain cannot absorb a merely nearby stroke.
     Pending candidates sit in a heap and only pairs touching a merged path are
-    rebuilt: a chain of n fragments costs O(n log n), not n rescans of every
-    pair.
+    rebuilt, so a chain of n fragments is not rescanned n times. Fragments
+    whose endpoints pile into one grid cell still cost their pairwise
+    candidate count: that is the hatch/glyph case, not the dash case.
     """
     paths = [np.asarray(path, dtype=float) for path, _ in entries]
     widths = [width for _, width in entries]
@@ -458,10 +462,9 @@ def _split_at_corners(path: np.ndarray, dpi: float) -> list[np.ndarray]:
     """Index spans between corner vertices of the simplified trace.
 
     A closed parcel traces as one cycle; straight runs only exist after
-    splitting where the trace turns sharply. The turn is measured over a short
-    window of the trace, not between neighbouring simplification vertices: a
-    smooth arc's vertices each carry a share of its curvature, and judging
-    those would shred the arc.
+    splitting where the trace turns sharply. A smooth small arc still splits
+    into spans here; separating corner from curvature is the curve fitting
+    that lands with convert() (issue #22).
     """
     simplified = _simplify(path, dpi)
     if len(simplified) < 2:
@@ -470,8 +473,20 @@ def _split_at_corners(path: np.ndarray, dpi: float) -> list[np.ndarray]:
     # Simplification may drop the repeated closing vertex; keep it cyclically.
     closed_polygon = closed and len(simplified) > 3 and bool(np.allclose(simplified[0], simplified[-1]))
     polygon = simplified[:-1] if closed_polygon else simplified
-    markers = sorted(set(_corner_indices(path, polygon, closed, dpi)))
-    if not markers or len(markers) == 1:
+    corners = _corner_indices(polygon, closed)
+    # Polygon vertices are a subsequence of the path, so a monotone cursor maps
+    # them without rescanning the whole path per corner.
+    markers = []
+    cursor = 0
+    for corner in corners:
+        vertex = polygon[corner]
+        index = cursor + int(
+            np.argmin(np.hypot(path[cursor:, 0] - vertex[0], path[cursor:, 1] - vertex[1]))
+        )
+        cursor = index
+        markers.append(index)
+    markers = sorted(set(markers))
+    if not markers or (len(markers) == 1 and closed):
         # No corner, or one corner that closes the cycle, which is still one span.
         return [np.arange(len(path))]
     if not closed:
@@ -491,41 +506,25 @@ def _split_at_corners(path: np.ndarray, dpi: float) -> list[np.ndarray]:
     return spans
 
 
-def _corner_indices(path: np.ndarray, polygon: np.ndarray, closed: bool, dpi: float) -> list[int]:
-    """Indices where the trace turns sharply enough to end a straight run.
+def _corner_indices(polygon: np.ndarray, closed: bool) -> list[int]:
+    """Vertices where the trace turns more than ``_CORNER_DEG``.
 
-    Directions are compared over a short window either side of each simplified
-    vertex, and only a turn the neighbouring vertices do not share counts: a
-    smooth arc's vertices each carry a similar slice of its curvature, so an
-    arc survives as one span while a corner between straighter runs splits.
+    A smooth small arc still splits here; which of its spans is a corner and
+    which is curvature needs the curve fitting that lands with convert()
+    (issue #22).
     """
-    points = path[:-1] if closed and np.allclose(path[0], path[-1]) else path
-    window = max(2, round(_scaled(4.0, dpi)))
     limit = np.radians(_CORNER_DEG)
-    sharp = np.radians(_SHARP_CORNER_DEG)
-    measured: list[tuple[int, float]] = []  # (path index, absolute turn), in polygon order
-    for k, vertex in enumerate(polygon):
+    corners = []
+    for k in range(len(polygon)):
         if not closed and k in (0, len(polygon) - 1):
             continue
-        index = int(np.argmin(np.hypot(points[:, 0] - vertex[0], points[:, 1] - vertex[1])))
-        before = points[(index - window) % len(points)] if closed else points[max(0, index - window)]
-        after = points[(index + window) % len(points)] if closed else points[min(len(points) - 1, index + window)]
-        incoming, outgoing = points[index] - before, after - points[index]
+        incoming = polygon[k] - polygon[k - 1]
+        outgoing = polygon[(k + 1) % len(polygon)] - polygon[k]
         if np.hypot(*incoming) == 0 or np.hypot(*outgoing) == 0:
             continue
-        measured.append((index, abs(float(np.arctan2(_cross(incoming, outgoing), float(np.dot(incoming, outgoing)))))))
-    corners = []
-    for position, (index, turn) in enumerate(measured):
-        if turn <= limit:
-            continue
-        left = measured[position - 1][1] if position > 0 else (measured[-1][1] if closed and len(measured) > 1 else 0.0)
-        right = (
-            measured[position + 1][1]
-            if position + 1 < len(measured)
-            else (measured[0][1] if closed and len(measured) > 1 else 0.0)
-        )
-        if turn > sharp or turn > _CORNER_ISOLATION * max(left, right):
-            corners.append(index)
+        turn = np.arctan2(_cross(incoming, outgoing), float(np.dot(incoming, outgoing)))
+        if abs(turn) > limit:
+            corners.append(k)
     return corners
 
 
@@ -544,19 +543,31 @@ def _drop_duplicates(entries: list[tuple[np.ndarray, float]], dpi: float) -> lis
     kept: list[tuple[np.ndarray, float]] = []
     lengths: list[float] = []
     index: dict[tuple[int, int], list[int]] = {}
+    long_kept: list[int] = []  # bboxes too large to bucket, checked by every query
+    cells_of: list[set[tuple[int, int]]] = []  # the kept path's cells, reused across queries
+
+    def cells_in(box: tuple[float, float, float, float]) -> list[tuple[int, int]]:
+        return [
+            (col, row)
+            for col in range(int(box[0] // cell), int(box[2] // cell) + 1)
+            for row in range(int(box[1] // cell), int(box[3] // cell) + 1)
+        ]
+
     for path, width in sorted(entries, key=lambda entry: _arc_length(entry[0]), reverse=True):
         length = _arc_length(path)
-        query = _bbox(path, 2.0 * tolerance)
-        candidates: set[int] = set()
-        for col in range(int(query[0] // cell), int(query[2] // cell) + 1):
-            for row in range(int(query[1] // cell), int(query[3] // cell) + 1):
-                candidates.update(index.get((col, row), ()))
+        query_cells = cells_in(_bbox(path, 2.0 * tolerance))
+        candidates = set(long_kept)
+        if len(query_cells) <= _MAX_INDEX_CELLS:
+            for key in query_cells:
+                candidates.update(index.get(key, ()))
+        else:
+            candidates.update(range(len(kept)))  # a very long run: linear is cheaper
         duplicate = False
         for k in candidates:
             if lengths[k] < 2.0 * length:
                 continue
             if _boxes_overlap(_bbox(path, tolerance), _bbox(kept[k][0], tolerance)) and _runs_alongside(
-                path, kept[k][0], tolerance
+                path, cells_of[k], tolerance
             ):
                 duplicate = True
                 break
@@ -564,10 +575,13 @@ def _drop_duplicates(entries: list[tuple[np.ndarray, float]], dpi: float) -> lis
             continue
         kept.append((path, width))
         lengths.append(length)
-        raw = _bbox(path, 0.0)
-        for col in range(int(raw[0] // cell), int(raw[2] // cell) + 1):
-            for row in range(int(raw[1] // cell), int(raw[3] // cell) + 1):
-                index.setdefault((col, row), []).append(len(kept) - 1)
+        cells_of.append({(int(x // tolerance), int(y // tolerance)) for x, y in path})
+        raw_cells = cells_in(_bbox(path, 0.0))
+        if len(raw_cells) <= _MAX_INDEX_CELLS:
+            for key in raw_cells:
+                index.setdefault(key, []).append(len(kept) - 1)
+        else:
+            long_kept.append(len(kept) - 1)
     return kept
 
 
@@ -584,14 +598,13 @@ def _boxes_overlap(a: tuple[float, float, float, float], b: tuple[float, float, 
     return a[0] <= b[2] and b[0] <= a[2] and a[1] <= b[3] and b[1] <= a[3]
 
 
-def _runs_alongside(short: np.ndarray, long: np.ndarray, tolerance: float) -> bool:
-    """True when most of ``short`` lies within ``tolerance`` of ``long``."""
-    cells = {(int(x // tolerance), int(y // tolerance)) for x, y in long}
+def _runs_alongside(short: np.ndarray, long_cells: set[tuple[int, int]], tolerance: float) -> bool:
+    """True when most of ``short`` lies within ``tolerance`` of a long run's cells."""
     sample = short[:: max(1, len(short) // 100)]
     nearby = 0
     for x, y in sample:
         col, row = int(x // tolerance), int(y // tolerance)
-        if any((col + dx, row + dy) in cells for dx in (-1, 0, 1) for dy in (-1, 0, 1)):
+        if any((col + dx, row + dy) in long_cells for dx in (-1, 0, 1) for dy in (-1, 0, 1)):
             nearby += 1
     return nearby / len(sample) >= 0.8
 
@@ -626,9 +639,11 @@ def _is_distractor(points: np.ndarray, width: float, dpi: float) -> bool:
     """Thin or tiny linework: right-of-way lines, table borders, glyphs, monuments."""
     if width < _scaled(_MIN_STROKE_PX, dpi):
         return True
-    # The skeleton stops about half a stroke width short of each end, so allow
-    # that ink back before calling a short run a monument mark.
-    allowance = min(2.0 * width, _scaled(_MIN_EXTENT_PX / 2.0, dpi))
+    # The skeleton stops short of a stroke's free ends and rounds it into
+    # corners, so allow roughly that ink back before calling a short span a
+    # monument mark. Straight spans stay within this allowance; the curved
+    # fragments of a small arc are what issue #22's curve fitting must sort out.
+    allowance = min(1.5 * width, _scaled(_MIN_EXTENT_PX / 2.0, dpi))
     extent = float(np.hypot(np.ptp(points[:, 0]), np.ptp(points[:, 1])))
     return extent < _scaled(_MIN_EXTENT_PX, dpi) - allowance
 
