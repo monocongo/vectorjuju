@@ -48,12 +48,25 @@ def load_raster(path: str | Path, dpi: int = 200) -> Image.Image:
 def _load_pdf(path: Path, dpi: int) -> Image.Image:
     try:
         pdf = pdfium.PdfDocument(str(path))
+    except MemoryError:
+        raise
     except Exception as exc:
         raise UnsupportedInputError(f"cannot read PDF: {path.name}") from exc
     try:
         if len(pdf) != 1:
             raise UnsupportedInputError(f"PDF must have exactly one page, found {len(pdf)}: {path.name}")
-        return pdf[0].render(scale=dpi / 72).to_pil().convert("RGB")
+        page = pdf[0]
+        width_pt, height_pt = page.get_size()
+        pixels = width_pt * height_pt * (dpi / 72) ** 2
+        if pixels > Image.MAX_IMAGE_PIXELS:
+            raise UnsupportedInputError(f"page too large to render at {dpi} dpi: {path.name}")
+        return page.render(scale=dpi / 72).to_pil().convert("RGB")
+    except UnsupportedInputError:
+        raise
+    except MemoryError:
+        raise
+    except Exception as exc:
+        raise UnsupportedInputError(f"cannot render PDF: {path.name}") from exc
     finally:
         pdf.close()
 
@@ -64,8 +77,12 @@ def _load_image(path: Path) -> Image.Image:
             frames = getattr(image, "n_frames", 1)
             if frames != 1:
                 raise UnsupportedInputError(f"image must have exactly one frame, found {frames}: {path.name}")
+            if image.size[0] * image.size[1] > Image.MAX_IMAGE_PIXELS:
+                raise UnsupportedInputError(f"image too large to decode: {path.name}")
             return ImageOps.exif_transpose(image).convert("RGB")
     except UnsupportedInputError:
+        raise
+    except MemoryError:
         raise
     except Exception as exc:
         raise UnsupportedInputError(f"cannot read image: {path.name}") from exc

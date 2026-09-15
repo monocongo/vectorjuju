@@ -30,6 +30,7 @@ def bad_inputs(tmp_path_factory: pytest.TempPathFactory) -> Path:
     (out / "sheet.txt").write_text("not a plat", encoding="utf-8")
     (out / "corrupt.pdf").write_bytes(b"%PDF-1.4\nnot really a pdf")
     (out / "corrupt.tif").write_bytes(b"not a tiff")
+    (out / "empty.pdf").write_bytes(b"")
     two_pages = canvas.Canvas(str(out / "two_page.pdf"), pagesize=(PAGE_W, PAGE_H))
     two_pages.showPage()
     two_pages.showPage()
@@ -50,6 +51,8 @@ def test_all_media_load_to_the_same_upright_raster(sheet: Path) -> None:
     assert ImageChops.difference(pdf, tif).getbbox() is None
 
     # JPEG is lossy; the decoded raster must still track the lossless one.
+    # Measured mean-abs-diff on this fixture is ~5.6; 20 leaves headroom for
+    # libjpeg/Pillow version drift across CI runners without masking a real bug.
     assert ImageStat.Stat(ImageChops.difference(tif, jpg).convert("L")).mean[0] < 20
 
 
@@ -57,8 +60,43 @@ def test_unsupported_input_error_is_a_vectorjuju_error() -> None:
     assert issubclass(UnsupportedInputError, VectorjujuError)
 
 
+def test_uppercase_extension_still_loads(sheet: Path, tmp_path: Path) -> None:
+    upper = tmp_path / "SHEET.PDF"
+    upper.write_bytes((sheet / "sheet.pdf").read_bytes())
+    assert load_raster(upper).size == EXPECTED_SIZE
+
+
+def test_load_raster_dpi_scales_the_pdf_render(sheet: Path) -> None:
+    half = load_raster(sheet / "sheet.pdf", dpi=100)
+    assert half.size == (EXPECTED_SIZE[0] // 2, EXPECTED_SIZE[1] // 2)
+
+
+def test_oversized_pdf_page_is_rejected(tmp_path: Path) -> None:
+    huge = tmp_path / "huge.pdf"
+    huge_page = canvas.Canvas(str(huge), pagesize=(20000, 20000))
+    huge_page.showPage()
+    huge_page.save()
+    with pytest.raises(UnsupportedInputError):
+        load_raster(huge)
+
+
+def test_zero_dpi_raises_unsupported_input_error_instead_of_leaking(sheet: Path) -> None:
+    with pytest.raises(UnsupportedInputError):
+        load_raster(sheet / "sheet.pdf", dpi=0)
+
+
 @pytest.mark.parametrize(
-    "media", ["sheet.txt", "corrupt.pdf", "corrupt.tif", "two_page.pdf", "two_frame.tif", "zero_page.pdf"]
+    "media",
+    [
+        "sheet.txt",
+        "corrupt.pdf",
+        "corrupt.tif",
+        "empty.pdf",
+        "missing.pdf",
+        "two_page.pdf",
+        "two_frame.tif",
+        "zero_page.pdf",
+    ],
 )
 def test_unsupported_inputs_raise_and_write_nothing(bad_inputs: Path, media: str) -> None:
     before = set(bad_inputs.iterdir())
