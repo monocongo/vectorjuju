@@ -141,6 +141,8 @@ tests/conftest.py                     session-scoped synthetic sheet; per-media 
 tests/test_convert_units.py           U1–U5, no OCR
 tests/test_convert_acceptance.py      A1–A11, OCR, pytest.mark.acceptance
 tests/acceptance_helpers.py           pt<->px<->cad, label classify, segment/arc comparison, write_overlay()
+tests/test_tracing.py                 U3 straight half, on rasters drawn in the test
+tests/test_tracing_plat.py            A7 at run level, over the generated sheet
 ```
 
 Split rule: assertable against planted geometry or a pure function → unit.
@@ -199,10 +201,10 @@ repeatable rather than a vibe.
 
 ## Dependencies
 
-`convert()` brings `ezdxf`, `numpy`, `docling`, OpenCV, and `scikit-image` as runtime
-dependencies; the suite adds none beyond those — `ezdxf` is what the gates
-reopen the DXF with, and `pillow`/`pypdfium2` are already dev dependencies, the
-overlay helper included. No matplotlib, no golden-image tooling.
+`convert()` brings `ezdxf`, `numpy`, `docling`, OpenCV, `scikit-image`, and
+`pillow` as runtime dependencies; the suite adds none beyond those — `ezdxf` is
+what the gates reopen the DXF with, and `pypdfium2` is already a dev dependency,
+the overlay helper included. No matplotlib, no golden-image tooling.
 
 ## Definition of done
 
