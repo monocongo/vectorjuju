@@ -92,9 +92,8 @@ def norm_text(s: str) -> str:
 
 
 def alnum_text(s: str) -> str:
-    """Digits, letters, and the decimal point -- the 'are the marks the only thing
-    wrong?' view. Losing the period is a 100x distance error, not a mark loss."""
-    return re.sub(r"[^0-9A-Z.]", "", norm_text(s))
+    """Digits and letters only -- the 'are the marks the only thing wrong?' view."""
+    return re.sub(r"[^0-9A-Z]", "", norm_text(s))
 
 
 def mark_counts(s: str) -> dict[str, int]:
@@ -103,20 +102,24 @@ def mark_counts(s: str) -> dict[str, int]:
 
 def classify(recovered: str, truth: str) -> dict:
     """Verdict for one recovered label string against its planted truth."""
+    got_norm, want_norm = norm_text(recovered), norm_text(truth)
     if not recovered.strip():
         verdict = "missed"
     elif recovered == truth:
         verdict = "exact"
-    elif norm_text(recovered) == norm_text(truth):
+    elif got_norm == want_norm:
         verdict = "normalized"
-    elif alnum_text(recovered) == alnum_text(truth):
+    # Decimals must match too: alnum_text ignores them because the 180-degree
+    # tie-break in ocr_crop measures reads by it, but a dropped point turns
+    # "200.16'" into "20016'", a 100x distance error, not a lost unit mark.
+    elif alnum_text(recovered) == alnum_text(truth) and got_norm.count(".") == want_norm.count("."):
         verdict = "text_only"
     else:
-        ratio = difflib.SequenceMatcher(None, norm_text(recovered), norm_text(truth)).ratio()
+        ratio = difflib.SequenceMatcher(None, got_norm, want_norm).ratio()
         verdict = "garbled" if ratio >= 0.55 else "missed"
     # Marks are counted on normalized text for the same reason the verdict is:
     # a prime is an apostrophe, so raw counts report a loss the verdict calls fine.
-    got, want = mark_counts(norm_text(recovered)), mark_counts(norm_text(truth))
+    got, want = mark_counts(got_norm), mark_counts(want_norm)
     return {
         "verdict": verdict,
         "recovered": recovered,
