@@ -83,15 +83,18 @@ _PUNCT = {
 
 
 def norm_text(s: str) -> str:
-    s = unicodedata.normalize("NFKC", s)
+    # _PUNCT first: NFKC folds the ordinal indicator to a letter "o" and splits
+    # the double prime into two primes, so nothing running after it can undo either.
     for k, v in _PUNCT.items():
         s = s.replace(k, v)
+    s = unicodedata.normalize("NFKC", s)
     return re.sub(r"\s+", " ", s).strip().upper()
 
 
 def alnum_text(s: str) -> str:
-    """Digits and letters only -- the 'are the marks the only thing wrong?' view."""
-    return re.sub(r"[^0-9A-Z]", "", norm_text(s))
+    """Digits, letters, and the decimal point -- the 'are the marks the only thing
+    wrong?' view. Losing the period is a 100x distance error, not a mark loss."""
+    return re.sub(r"[^0-9A-Z.]", "", norm_text(s))
 
 
 def mark_counts(s: str) -> dict[str, int]:
@@ -111,7 +114,9 @@ def classify(recovered: str, truth: str) -> dict:
     else:
         ratio = difflib.SequenceMatcher(None, norm_text(recovered), norm_text(truth)).ratio()
         verdict = "garbled" if ratio >= 0.55 else "missed"
-    got, want = mark_counts(recovered), mark_counts(truth)
+    # Marks are counted on normalized text for the same reason the verdict is:
+    # a prime is an apostrophe, so raw counts report a loss the verdict calls fine.
+    got, want = mark_counts(norm_text(recovered)), mark_counts(norm_text(truth))
     return {
         "verdict": verdict,
         "recovered": recovered,
@@ -564,7 +569,9 @@ def run_private(path: Path, engine_names: list[str], max_crops: int) -> None:
                 else [{"text": res["text"], "box_px": [0, 0, *px_size]}]
             )
             hits = [ln for ln in lines if BEARING_RE.search(norm_text(ln["text"]))]
-            counts = {m: sum(1 for h in hits if m in h["text"]) for m in MARKS}
+            # Normalize before counting, as the crop path does below: a prime or an
+            # ordinal indicator is the same mark as ' or °.
+            counts = {m: sum(1 for h in hits if m in norm_text(h["text"])) for m in MARKS}
             mark_note = ", ".join(
                 f"{counts[m]} with a {name}"
                 for m, name in zip(MARKS, ("degree mark", "foot/minute mark", "seconds/inch mark"), strict=True)
@@ -588,7 +595,8 @@ def run_private(path: Path, engine_names: list[str], max_crops: int) -> None:
         print(
             "full-page reads of those candidates: "
             f"{sum(1 for c in candidates if BEARING_RE.search(norm_text(c['text'])))}/{len(candidates)} bearing-shaped, "
-            f"{sum(1 for c in candidates if all(m in c['text'] for m in MARKS))}/{len(candidates)} with all three marks"
+            f"{sum(1 for c in candidates if all(m in norm_text(c['text']) for m in MARKS))}/"
+            f"{len(candidates)} with all three marks"
         )
 
         for eng in engine_names:
@@ -660,6 +668,9 @@ def self_check() -> int:
         "marks replaced by spaces are still mark-only losses"
     )
     assert classify("S 3°21'59\" W  170.29*", call)["verdict"] in ("garbled", "missed")
+    # That string scores under the 0.55 ratio cut, i.e. "missed", so the garbled
+    # tier needs a case of its own -- deleting the tier would otherwise go unnoticed.
+    assert classify("N 35°09'59\" E 200.16'XXX", call)["verdict"] == "garbled"
     assert classify("", call)["verdict"] == "missed"
     assert classify("ZEBRA", call)["verdict"] == "missed"
 
