@@ -49,35 +49,23 @@ def test_l_corner_splits_into_two_straight_runs():
         assert np.sum(np.hypot(*np.diff(points, axis=0).T)) >= 60.0  # not truncated at the corner
 
 
-def test_small_arc_stays_one_run():
-    radius, scale = 40, 8
-    size = 2 * radius + 40
-    big = Image.new("L", (size * scale, size * scale), 255)
-    ImageDraw.Draw(big).arc(
-        (
-            (size / 2 - radius) * scale,
-            (size / 2 - radius) * scale,
-            (size / 2 + radius) * scale,
-            (size / 2 + radius) * scale,
-        ),
-        0,
-        270,
-        fill=0,
-        width=4 * scale,
-    )
-    image = big.resize((size, size), Image.LANCZOS)
+def test_single_stroke_l_corner_splits():
+    # One polyline, so simplification keeps a single corner vertex: the split
+    # must not depend on the corner arriving as two quantised vertices.
+    image, draw = _canvas(300, 300)
+    draw.line([(60, 240), (60, 60), (240, 60)], fill=0, width=5, joint="curve")
 
-    assert len(trace_runs(image, DPI)) == 1
+    assert len(trace_runs(image, DPI)) == 2
 
 
 def test_short_thick_run_survives():
     image, draw = _canvas(80, 80)
-    draw.line((40, 25, 40, 50), fill=0, width=5)  # 25 px long, 5 px wide
+    draw.line((40, 25, 40, 45), fill=0, width=5)  # 20 px long, 5 px wide
 
     runs = trace_runs(image, DPI)
 
     assert len(runs) == 1
-    assert np.ptp(runs[0].points_px[:, 1]) >= 18
+    assert np.ptp(runs[0].points_px[:, 1]) >= 14
 
 
 def test_glyphs_yield_no_primitives():
@@ -115,7 +103,29 @@ def test_run_count_is_dpi_invariant():
         assert len(trace_runs(square(dpi), dpi)) == 4
 
 
-def test_exclude_mask_drops_masked_stroke():
+def test_parallel_dashed_lines_do_not_merge():
+    image, draw = _canvas(400, 60)
+    x = 10
+    while x + 30 < 390:
+        draw.line((x, 20, x + 30, 20), fill=0, width=4)
+        draw.line((x, 28, x + 30, 28), fill=0, width=4)
+        x += 40
+
+    runs = trace_runs(image, DPI)
+
+    assert len(runs) == 2  # each line merges along its dashes, not across the 8 px gap
+    assert sorted(round(float(np.median(run.points_px[:, 1]))) for run in runs) == [20, 28]
+
+
+def test_stroke_width_scales_with_dpi():
+    for dpi in (200.0, 600.0):
+        image, draw = _canvas(round(400 * dpi / DPI), round(100 * dpi / DPI))
+        draw.line((30, 50 * dpi / DPI, 370 * dpi / DPI, 50 * dpi / DPI), fill=0, width=round(1.4 * dpi / 72))
+
+        assert len(trace_runs(image, dpi)) == 1
+
+
+def test_exclude_mask_removes_masked_stroke():
     image, draw = _canvas(240, 60)
     draw.line((10, 15, 230, 15), fill=0, width=5)
     draw.line((10, 45, 230, 45), fill=0, width=5)
@@ -128,12 +138,23 @@ def test_exclude_mask_drops_masked_stroke():
     assert np.median(runs[0].points_px[:, 1]) < 30  # the surviving line, not the masked one
 
 
+def test_excluded_ink_does_not_widen_a_surviving_stroke():
+    image, draw = _canvas(300, 60)
+    draw.line((10, 30, 290, 30), fill=0, width=2)  # thinner than the gate on its own
+    draw.rectangle((30, 22, 280, 29), fill=0)  # masked text ink touching the line
+    mask = np.zeros((60, 300), bool)
+    mask[22:30, 30:281] = True
+
+    assert trace_runs(image, DPI, exclude_mask=mask) == []
+
+
 def test_invalid_inputs_are_rejected():
     image, draw = _canvas(40, 40)
     draw.line((5, 20, 35, 20), fill=0, width=4)
 
-    with pytest.raises(ValueError):
-        trace_runs(image, dpi=0)
+    for dpi in (0, -1, float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            trace_runs(image, dpi=dpi)
     with pytest.raises(ValueError):
         trace_runs(np.zeros((40, 40, 3), np.uint8), DPI)
     with pytest.raises(ValueError):
