@@ -125,3 +125,11 @@ def test_transform_refuses_pixel_units_without_calibration() -> None:
         px_to_cad((1.0, 2.0), img_height=100)
     with pytest.raises(ValueError):
         cad_to_px((1.0, 2.0), img_height=100)
+
+
+@pytest.mark.parametrize("fpp", [0.0, -0.42, float("nan"), float("inf")])
+def test_transform_refuses_scales_that_cannot_be_a_calibration(fpp: float) -> None:
+    with pytest.raises(ValueError):
+        px_to_cad((1.0, 2.0), fpp=fpp, img_height=100)
+    with pytest.raises(ValueError):
+        cad_to_px((1.0, 2.0), fpp=fpp, img_height=100)

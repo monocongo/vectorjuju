@@ -11,6 +11,7 @@ There is no pixel-unit fallback: transforming before calibration raises.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pypdfium2 as pdfium
@@ -26,6 +27,14 @@ class VectorjujuError(Exception):
 
 class UnsupportedInputError(VectorjujuError):
     """Input is not a supported single-page PDF, JPG, or TIFF."""
+
+
+def _require_fpp(fpp: float | None, caller: str) -> float:
+    if fpp is None:
+        raise ValueError(f"{caller} requires a calibrated fpp; pixel-unit output is not an option")
+    if not math.isfinite(fpp) or fpp <= 0:
+        raise ValueError(f"{caller} requires a finite fpp > 0, got {fpp!r}")
+    return fpp
 
 
 def load_raster(path: str | Path, dpi: int = 200) -> Image.Image:
@@ -90,15 +99,13 @@ def _load_image(path: Path) -> Image.Image:
 
 def px_to_cad(pt: tuple[float, float], *, fpp: float | None = None, img_height: int) -> tuple[float, float]:
     """Raster px (top-left, y down) -> CAD units (bottom-left, y up)."""
-    if fpp is None:
-        raise ValueError("px_to_cad requires a calibrated fpp; pixel-unit output is not an option")
+    fpp = _require_fpp(fpp, "px_to_cad")
     x, y = pt
     return x * fpp, (img_height - y) * fpp
 
 
 def cad_to_px(pt: tuple[float, float], *, fpp: float | None = None, img_height: int) -> tuple[float, float]:
     """CAD units (bottom-left, y up) -> raster px (top-left, y down)."""
-    if fpp is None:
-        raise ValueError("cad_to_px requires a calibrated fpp; pixel-unit output is not an option")
+    fpp = _require_fpp(fpp, "cad_to_px")
     x, y = pt
     return x / fpp, img_height - y / fpp
