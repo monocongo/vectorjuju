@@ -26,7 +26,7 @@ px = pt * dpi / 72
 cad_x = px_x * fpp                       # what convert() promises
 cad_y = (img_height - px_y) * fpp
 planted fpp = 72 / (0.85 * dpi)          # 0.423529 ft/px at the default dpi=200
-planted fpp_m = planted fpp * 1200 / 3937  # 0.129093 m/px, for a metre run
+planted fpp_m = planted fpp * 1200 / 3937  # 0.129092 m/px, for a metre run
 ```
 
 `0.85` is `synthetic_plat.SCALE_PT_PER_FT`; `fpp` is the sidecar's
@@ -57,8 +57,9 @@ Thresholds are derived, not tuned:
   fallback is a failure (A4); the contract's SPLINE fallback is for real traces
   that don't fit a circle, and the fixture plants none.
 - **5°** on label rotation: trace-direction jitter (~1° for 2 px over a 100 px
-  run) has to pass, a mirrored label must not, and the 15°-wide buckets compare
-  magnitudes only.
+  run) has to pass, and the magnitude-only buckets cannot reject a mirrored
+  label; 5° does, except on the flat ~2° edge, where a mirror sits inside the
+  jitter band and only the overlay catches it.
 - **20 px** label insertion is the distance from the emitted insertion point to
   the planted text box `quad_pt`, inside the box counting as zero — that
   absorbs OCR box drift and any corner-versus-centre convention, and the
@@ -103,7 +104,7 @@ comparison of a file with itself.
 | A3 | Distractors | No label-carrying entity lies within 3 px of either planted offset line; no string from `ground_truth["distractor_text"]`, no title-block text (a class the fixture must add to `distractor_text`, including `SCALE: 1" = 100'`), and no `curve_table_cells` value other than `C1`/`C2` bound to its own arc appears in any `entities[].label` — `unbound_text` is fine | 3 px, exact |
 | A4 | True arcs | Exactly 2 `ARC` on `BOUNDARY_CURVE`, 0 `SPLINE` (the fixture's arcs are clean circles), no dense polyline standing in; each planted curve ref `C1`/`C2` appears exactly once in an `entities[].label` on its planted curve entity; radius vs planted `radius_ft`; endpoints vs planted chord endpoints; ARC midpoint vs the planted curve label anchor (proves bulge side) | ≤ 3 % / ≤ 4 px / ≤ 8 px |
 | A5 | Units | Default run: `$INSUNITS == 21`, `doc.units == 21`, `sidecar.units == "us-survey-foot"`; `international-foot` variant → 2; `metre` variant → 6, `sidecar.scale.value` vs `fpp_m` and every CAD coordinate in metres | exact / ≤ 1 % on the scale |
-| A6 | Labels | Every rotation ∈ (-90, 90]; each straight call's rotation within 5° of its planted `rotation_deg` (already normalised, so it is the same whichever way the run was traced) — the bucket follows, and a mirrored label fails where an `abs()` bucket test would pass it; insertion within 20 px of the planted text box `quad_pt` (inside = 0) | exact / 5° / 20 px |
+| A6 | Labels | Every rotation ∈ (-90, 90]; each straight call's rotation within 5° of its planted `rotation_deg` (already normalised, so it is the same whichever way the run was traced) — the bucket follows, and a mirror of a non-flat label fails where a magnitude-only bucket test would pass it; insertion within 20 px of the planted text box `quad_pt` (inside = 0) | exact / 5° / 20 px |
 | A7 | Run continuity | Per planted straight edge, exactly one `LWPOLYLINE` runs within 3 px of it, its two extreme vertices reach within 8 px of the edge's endpoints, and no second parallel entity runs within 3 px (double-edge regression) | 3 px / 8 px |
 | A8 | Determinism | Two runs on one input produce identical DXF bytes and identical JSON bytes | exact |
 | A9 | Media agreement | A1–A8 pass for each medium; matching entities agree across media within 3 px; bound label text sets identical | 3 px |
