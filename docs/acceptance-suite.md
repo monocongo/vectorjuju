@@ -199,7 +199,7 @@ repeatable rather than a vibe.
 
 ## Dependencies
 
-`convert()` brings `ezdxf`, `numpy`, `docling`, and OpenCV as runtime
+`convert()` brings `ezdxf`, `numpy`, `docling`, OpenCV, and `scikit-image` as runtime
 dependencies; the suite adds none beyond those — `ezdxf` is what the gates
 reopen the DXF with, and `pillow`/`pypdfium2` are already dev dependencies, the
 overlay helper included. No matplotlib, no golden-image tooling.
