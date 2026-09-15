@@ -9,11 +9,18 @@ mitigation proposed there: OpenCV deskews a crop per label before OCR.
 This prototype measures that mitigation on the project-authored synthetic
 sheet, scored against its own ``ground_truth.json``:
 
-* ``page-*`` -- prior-art style full-page OCR, boxes associated to labels.
-  This is the baseline comparable to issue #7's docling numbers.
+* ``page-*`` -- prior-art style full-page OCR, boxes associated to labels. This
+  is the baseline comparable to issue #7's docling numbers, which live in the
+  [#7 findings comment](https://github.com/monocongo/vectorjuju/issues/7#issuecomment-5680342801)
+  -- the prior-art prototype only ever printed to stdout.
 * ``crop-*`` -- OpenCV traces the line under each label, takes the deskew
   direction from that traced segment, cuts an upright band around the label,
   and OCRs the band alone.
+* ``cropaxis-*`` -- control: the same band centre and size with the rotation
+  removed. The band stays axis-aligned while the label does not, so it also
+  clips the rotated text -- control reads come back as fragments (``9" W``,
+  ``7'59" E``) -- and a control miss therefore means "rotation or clipping",
+  not rotation alone.
 
 Two deliberate methodological choices, both carried from issue #7:
 
@@ -35,12 +42,18 @@ Run on the synthetic sheet (macOS, docling models already cached):
     uv run --with 'docling[ocrmac]' --with opencv-python --with ocrmac \\
         python prototypes/diagonal_call_labels.py --out /private/tmp/vj8
 
-Private plat (aggregate counts only -- no text, crop, or coordinate is printed
-or written):
+Private plat (aggregate counts only: no recognized text or coordinate is printed
+or written, and crops -- including the full page, when tesseract locates
+candidates -- exist only in a temporary directory removed at exit):
 
     uv run --with 'docling[ocrmac]' --with opencv-python --with ocrmac \\
         python prototypes/diagonal_call_labels.py \\
         --private /path/to/private_plat.png
+
+``--engines`` defaults to ``docling,tesseract``: pass ``--engines
+docling,tesseract,ocrmac`` for the three-engine tables quoted in the PR. Docling
+and ocrmac arrive as pip extras (above); ``tesseract`` is a system binary
+(brew/apt), and without it the ``*tesseract`` rows report UNAVAILABLE.
 
 Self-check without OCR or network:
 
@@ -65,6 +78,7 @@ from pathlib import Path
 from PIL import Image
 
 MARKS = "°'\""
+ENGINE_NAMES = ("docling", "tesseract", "ocrmac")
 PAGE_PSM, CROP_PSM = 11, 7  # tesseract: sparse page, then single text line
 TRACE_MAX_DIM = 2400  # Hough runs on a downscaled copy; crops come from the full raster
 UNASSOCIATED_PX = 90.0  # label anchor farther than this from any traced segment: report
@@ -449,24 +463,41 @@ def run_synthetic(out_dir: Path, engine_names: list[str]) -> dict:
     segs = trace_segments(img)
     print(f"traced  : {len(segs)} Hough segments (opencv)")
 
+    planted = {s["id"]: s for s in gt["segments"]}
     assoc, unassociated = {}, []
     for lab in labels:
         center = label_center_px(lab, gt, px_size)
         seg, dist = nearest_segment(center, segs)
         want_ang = -lab["rotation_deg"]  # PDF -> raster frame
         got_ang = math.degrees(math.atan2(seg[3] - seg[1], seg[2] - seg[0])) if seg else 0.0
-        assoc[lab["id"]] = {"seg": seg, "dist": dist, "angle_err": fold180(got_ang - want_ang)}
+        # The generator plants a parallel offset line 10pt from edges 0 and 5, closer
+        # to the label than its own boundary line, and on a steep label Hough can
+        # latch onto a stroke inside the label instead: either way the traced segment
+        # is not the label's own line, so record that distance beside it. Curve labels
+        # sit on an arc, whose chord distance would mislead.
+        own = planted.get(lab["segment_id"]) if lab["kind"] == "straight_call" else None
+        own_px = quad_to_px([own["start_pt"], own["end_pt"]], gt, px_size) if own else None
+        assoc[lab["id"]] = {
+            "seg": seg,
+            "dist": dist,
+            "dist_planted": point_seg_dist(center, own_px[0], own_px[1]) if own_px else None,
+            "angle_err": fold180(got_ang - want_ang),
+        }
         if dist > UNASSOCIATED_PX:
             unassociated.append(lab["id"])
     dists = [a["dist"] for a in assoc.values()]
     errs = [abs(a["angle_err"]) for a in assoc.values()]
+    # 3px of slack: a Hough fit to the label's own line lands within a pixel of it
+    off_line = [k for k, a in assoc.items() if a["dist_planted"] is not None and a["dist"] < a["dist_planted"] - 3.0]
     print(
         f"assoc   : anchor->segment mean {sum(dists) / len(dists):.1f}px max {max(dists):.1f}px | "
         f"|angle error| mean {sum(errs) / len(errs):.1f} deg max {max(errs):.1f} deg"
         + (f" | >{UNASSOCIATED_PX:.0f}px: {', '.join(unassociated)}" if unassociated else "")
+        + (f" | nearest traced segment is not the label's own line: {', '.join(off_line)}" if off_line else "")
     )
 
     results: dict[str, dict] = {}
+    unavailable: dict[str, str] = {}
     with tempfile.TemporaryDirectory(prefix="vj8-crops-") as tmp:
         workdir = Path(tmp)
         page_img = save_png(img, workdir / "page.png")
@@ -479,6 +510,7 @@ def run_synthetic(out_dir: Path, engine_names: list[str]) -> dict:
         for name, res in page_engines.items():
             if not res.get("available"):
                 print(f"{name}: UNAVAILABLE -- {res['reason']}")
+                unavailable[name] = res["reason"]
                 continue
             results[name] = {
                 lab["id"]: classify(match_page_label(lab, res["items"], px_size, gt), lab["text"]) for lab in labels
@@ -486,11 +518,11 @@ def run_synthetic(out_dir: Path, engine_names: list[str]) -> dict:
             print(f"{name}: {res['engine']} ({res.get('config', 'native')}) -- {len(res['items'])} items")
 
         for eng in engine_names:
-            if eng not in ("docling", "tesseract", "ocrmac"):
+            if eng not in ENGINE_NAMES:
                 continue
             for variant in ("crop", "cropaxis"):
                 name = f"{variant}-{eng}"
-                per_label, note = {}, ""
+                per_label, note, failed = {}, "", 0
                 for lab in labels:
                     seg = assoc[lab["id"]]["seg"]
                     if seg is None:
@@ -506,19 +538,31 @@ def run_synthetic(out_dir: Path, engine_names: list[str]) -> dict:
                         note = f"UNAVAILABLE -- {res['reason']}"
                         break
                     note = res["engine"]
+                    failed += 1 if res.get("error") else 0
                     per_label[lab["id"]] = classify(res["text"], lab["text"])
                 if note.startswith("UNAVAILABLE"):
                     print(f"{name}: {note}")
+                    unavailable[name] = note
                     continue
                 results[name] = per_label
-                print(f"{name}: {note}")
+                # A crop the converter refused is scored as a miss above, so say so:
+                # otherwise it reads as the engine failing to read text.
+                print(f"{name}: {note}" + (f" -- {failed} crop(s) failed to convert" if failed else ""))
 
         print_report(labels, results)
         scores = {
             "note": "Throwaway issue-#8 prototype output. Synthetic sheet only.",
             "sheet": meta,
             "traced_segments": len(segs),
-            "association": {k: {"dist_px": v["dist"], "angle_err_deg": v["angle_err"]} for k, v in assoc.items()},
+            "association": {
+                k: {
+                    "dist_px": v["dist"],
+                    "dist_planted_px": v["dist_planted"],
+                    "angle_err_deg": v["angle_err"],
+                }
+                for k, v in assoc.items()
+            },
+            "unavailable": unavailable,
             "results": results,
         }
         (out_dir / "diagonal_call_scores.json").write_text(json.dumps(scores, indent=2), encoding="utf-8")
@@ -552,8 +596,9 @@ def print_report(labels, results: dict) -> None:
 
 def run_private(path: Path, engine_names: list[str], max_crops: int) -> None:
     """Aggregate counts only. No recognized text, crop image, or coordinate is
-    printed or written: a real sheet is private, and there is no ground truth
-    locally to score against."""
+    targets, and there is no ground truth locally to
+    score against. Crops, and the full sheet when tesseract locates candidates,
+    are written to a temporary directory and removed at exit."""
     img, meta = load_raster(path)
     px_size = img.size
     segs = trace_segments(img)
@@ -614,7 +659,7 @@ def run_private(path: Path, engine_names: list[str], max_crops: int) -> None:
         )
 
         for eng in engine_names:
-            if eng not in ("docling", "tesseract", "ocrmac"):
+            if eng not in ENGINE_NAMES:
                 continue
             read_back, all_marks, distinct = 0, 0, set()
             for i, cand in enumerate(candidates):
@@ -730,6 +775,8 @@ def main() -> int:
     if args.self_check:
         return self_check()
     engines = [e.strip() for e in args.engines.split(",") if e.strip()]
+    if not engines or any(e not in ENGINE_NAMES for e in engines):
+        p.error(f"--engines takes a comma list of {', '.join(ENGINE_NAMES)}; got {args.engines!r}")
     if args.private:
         run_private(Path(args.private), engines, args.max_private_crops)
         return 0
