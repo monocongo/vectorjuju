@@ -15,25 +15,32 @@ Two verdict classes:
 
 ## Coordinate spaces and fixture math
 
-Ground truth is in **page points**; rasters are rendered at the run's `dpi`;
-CAD is feet. All gate distances are **raster pixels at that DPI** unless noted.
+Ground truth is in **page points**; rasters are rendered at 200 dpi
+(`synthetic_plat.RENDER_DPI`); CAD is in the run's `units`. All gate distances
+are **raster pixels at the run DPI** unless noted, and gates run at the default
+`dpi=200`: `convert()` rasterises the PDF there and the generator pre-renders
+TIFF/JPG there, so the `px = pt * dpi / 72` math holds for all three media.
 
 ```
 px = pt * dpi / 72
 cad_x = px_x * fpp                       # what convert() promises
 cad_y = (img_height - px_y) * fpp
-planted fpp = 72 / (0.85 * dpi)          # 0.423529 at the default dpi=200
+planted fpp = 72 / (0.85 * dpi)          # 0.423529 ft/px at the default dpi=200
+planted fpp_m = planted fpp * 1200 / 3937  # 0.129093 m/px, for a metre run
 ```
 
 `0.85` is `synthetic_plat.SCALE_PT_PER_FT`; `fpp` is the sidecar's
-`scale.value`. The sheet, its three media, and `ground_truth.json` come from
-`synthetic_plat.generate_sheet()` at test-session scope — generated, never
-committed ([Port the synthetic plat sheet
+`scale.value`, in the run's unit. US survey and international feet differ by
+2 ppm — far below the 1 % scale budget — so both foot runs share the `fpp`
+oracle and are told apart by `$INSUNITS` alone; a `metre` run uses `fpp_m` and
+every CAD-space gate compares metres. The sheet, its three media, and
+`ground_truth.json` come from `synthetic_plat.generate_sheet()` at test-session
+scope — generated, never committed ([Port the synthetic plat sheet
 generator](https://github.com/monocongo/vectorjuju/issues/6)).
 
 Planted counts: 6 parcel edges (4 straight calls, 2 curve refs), 2 parallel
-right-of-way offset lines, 6 curve-table rows including header, monuments,
-north arrow, scale bar, title block.
+right-of-way offset lines, a 3-row curve table (header plus `C1`/`C2`),
+monuments, north arrow, scale bar, title block.
 
 ## Gate tolerances
 
@@ -46,17 +53,26 @@ Thresholds are derived, not tuned:
   rounding on a 110–200 ft edge.
 - **8 px** end reach ≈ corner-splitting slop where a straight run meets an arc.
 - **3 %** on arc radius, **4 px** on arc endpoints, is looser than a clean
-  circle fit needs on purpose — a SPLINE fallback is a failure (A4), a
-  slightly-off radius is not.
-- **20 px** label insertion ≈ the planted anchor ± the 5 pt (14 px) text
-  offset and OCR box drift. The contract says insertion is the OCR position,
-  not a synthesized offset.
+  circle fit needs on purpose. On this fixture's clean 48-vertex arcs a SPLINE
+  fallback is a failure (A4); the contract's SPLINE fallback is for real traces
+  that don't fit a circle, and the fixture plants none.
+- **5°** on label rotation: trace-direction jitter (~1° for 2 px over a 100 px
+  run) has to pass, a mirrored label must not, and the 15°-wide buckets compare
+  magnitudes only.
+- **20 px** label insertion is the distance from the emitted insertion point to
+  the planted text box `quad_pt`, inside the box counting as zero — that
+  absorbs OCR box drift and any corner-versus-centre convention, and the
+  planted 5 pt draw offset is already inside the box. The contract says
+  insertion is the OCR position, not a synthesized offset.
 
 Label text fidelity reuses the classification from the throwaway
 `prototypes/diagonal_call_labels.py` (`text_only` etc.) — criteria, not its
-code: a read passes if its verdict is `exact`, `normalized`, or `text_only`.
-Lost unit-mark punctuation (`'` `"` `°`) is tolerated; a wrong digit, letter,
-or dropped `.` is not.
+code: a read passes if its verdict is `exact` or `normalized`, or `text_only`
+with no unit mark gained or swapped, i.e. `mark_counts(recovered)` is
+`mark_counts(truth)` with marks only ever missing. Lost unit-mark punctuation
+(`'` `"` `°`) is tolerated; a wrong digit, letter, dropped `.`, or a `200.16'`
+read as `200.16"` — a 12× unit error the bare `text_only` verdict would wave
+through — is not.
 
 ## Unit gates — no OCR, no full pipeline
 
@@ -68,27 +84,31 @@ a pure function lives here.
 | U1 | Transform | `px_to_cad(cad_to_px(p))` round trip; origin flip (top of raster → large CAD y) | ≤ 1e-6, 2 DPI × 2 fpp |
 | U2 | Calibration | Planted call distances vs planted pixel lengths recover `fpp` | relative error ≤ 1 % |
 | U3 | Classification | Planted 48-vertex arc → `curve` + circle fit; L-corner → `line`; 3 px stroke traces one centreline; glyph raster yields zero primitives; dashed run merges to one; same figure at 2 DPIs gives the same count | prior-art gates, carried |
-| U4 | DXF contract | `$ACADVER` AC1015; `$INSUNITS` 21 / 2 / 6 per `units`; layers exactly `BOUNDARY_LINE`/`BOUNDARY_CURVE`/`LABEL`; fitted curve emits `ARC`; MTEXT rotation ∈ (-90, 90]; no XDATA/APPID; reopen audit error list empty; per-layer counts match sidecar; sidecar keys/types match the contract schema; two writes byte-identical | exact |
+| U4 | DXF contract | `$ACADVER` AC1015; `$INSUNITS` 21 / 2 / 6 per `units`; the three layers exist and every entity sits on one of them, with the writer's mandatory `0` and `Defpoints` layers empty; fitted curve emits `ARC`; MTEXT rotation ∈ (-90, 90]; no XDATA and no APPID referenced by any entity (the DXF-mandated `ACAD` APPID stays in the table); reopen audit error list empty; per-layer counts match sidecar; sidecar keys/types match the contract schema; two writes byte-identical | exact |
 | U5 | Parsing and binding | Parser table incl. unit-mark variants and non-calls (`PARCEL 5`, `LOT 12`); a planted call beside a 10 pt-parallel offset line binds to the planted line; off-gate text lands in `unbound_text`, never force-bound | exact |
 
 ## Acceptance gates — full `convert()` per media
 
 `tests/test_convert_acceptance.py`, parametrised over `sheet.pdf`,
-`sheet.tif`, and the EXIF-rotated `sheet.jpg` from one generated fixture.
+`sheet.tif`, and the EXIF-rotated `sheet.jpg` from one generated fixture. Each
+medium converts into its own output directory: the contract's default `out` is
+`<stem>.dxf`, all three media share the stem `sheet`, and one shared directory
+would let a run overwrite the previous medium's output — turning A9 into a
+comparison of a file with itself.
 
 | # | Gate | Assertion | Tolerance |
 |---|---|---|---|
 | A1 | Scale | `sidecar.scale.value` vs planted `fpp`; `method == "ransac"`; with `scale=` override `method == "override"` | ≤ 1 % / ≤ 1e-9 |
-| A2 | Calls bound | Each of the 4 planted straight calls appears exactly once in `entities[].label`, on a `line` entity whose vertices lie within 3 px of its planted segment and whose endpoints reach within 8 px of that segment's endpoints; text verdict ∈ {`exact`, `normalized`, `text_only`} | as derived |
-| A3 | Distractors | No label-carrying entity lies within 3 px of either planted offset line; no planted distractor string (monuments, north arrow, scale bar, `CURVE TABLE`, table cells other than `C1`/`C2` on their own arcs) appears in any `entities[].label` — `unbound_text` is fine | 3 px, exact |
-| A4 | True arcs | Exactly 2 `ARC` on `BOUNDARY_CURVE`, 0 `SPLINE`, no dense polyline standing in; radius vs planted `radius_ft`; endpoints vs planted chord endpoints; ARC midpoint vs the planted curve label anchor (proves bulge side) | ≤ 3 % / ≤ 4 px / ≤ 8 px |
-| A5 | Units | Default run: `$INSUNITS == 21`, `doc.units == FT`, `sidecar.units == "us-survey-foot"`; metre variant → 6 | exact |
-| A6 | Labels | Every rotation ∈ (-90, 90]; each straight call's rotation bucket equals its planted `bucket`; insertion within 20 px of the planted anchor | exact / 20 px |
+| A2 | Calls bound | Each of the 4 planted straight calls appears exactly once in a sidecar `entities[].label` of type `line`; its interior vertices lie within 3 px of the planted segment and its two extreme vertices reach within 8 px of that segment's endpoints — the corner-splitting slop A7 uses, which replaces the 3 px bound at the ends; text passes the fidelity rule above | as derived |
+| A3 | Distractors | No label-carrying entity lies within 3 px of either planted offset line; no string from `ground_truth["distractor_text"]`, no title-block text (a class the fixture must add to `distractor_text`, including `SCALE: 1" = 100'`), and no `curve_table_cells` value other than `C1`/`C2` bound to its own arc appears in any `entities[].label` — `unbound_text` is fine | 3 px, exact |
+| A4 | True arcs | Exactly 2 `ARC` on `BOUNDARY_CURVE`, 0 `SPLINE` (the fixture's arcs are clean circles), no dense polyline standing in; each planted curve ref `C1`/`C2` appears exactly once in an `entities[].label` on its planted curve entity; radius vs planted `radius_ft`; endpoints vs planted chord endpoints; ARC midpoint vs the planted curve label anchor (proves bulge side) | ≤ 3 % / ≤ 4 px / ≤ 8 px |
+| A5 | Units | Default run: `$INSUNITS == 21`, `doc.units == 21`, `sidecar.units == "us-survey-foot"`; `international-foot` variant → 2; `metre` variant → 6, `sidecar.scale.value` vs `fpp_m` and every CAD coordinate in metres | exact / ≤ 1 % on the scale |
+| A6 | Labels | Every rotation ∈ (-90, 90]; each straight call's rotation within 5° of its planted `rotation_deg` (already normalised, so it is the same whichever way the run was traced) — the bucket follows, and a mirrored label fails where an `abs()` bucket test would pass it; insertion within 20 px of the planted text box `quad_pt` (inside = 0) | exact / 5° / 20 px |
 | A7 | Run continuity | Per planted straight edge, exactly one `LWPOLYLINE` runs within 3 px of it, its two extreme vertices reach within 8 px of the edge's endpoints, and no second parallel entity runs within 3 px (double-edge regression) | 3 px / 8 px |
 | A8 | Determinism | Two runs on one input produce identical DXF bytes and identical JSON bytes | exact |
 | A9 | Media agreement | A1–A8 pass for each medium; matching entities agree across media within 3 px; bound label text sets identical | 3 px |
-| A10 | Failure paths | Multi-page PDF, multi-page TIFF, unsupported extension, corrupt file → `UnsupportedInputError`; text-only page (no distances) → `ScaleCalibrationError`; no DXF at `out` after either | exact |
-| A11 | Sidecar ↔ DXF | Every sidecar entity maps 1:1 onto a DXF entity of its layer; no unaccounted layer | exact |
+| A10 | Failure paths | Multi-page PDF, multi-page TIFF, zero-page PDF, unsupported extension, corrupt file → `UnsupportedInputError`; text-only page (no distances) → `ScaleCalibrationError`; after either failure, on a fresh output path, neither `out` nor its `<stem>.json` sidecar exists | exact |
+| A11 | Sidecar ↔ DXF | Every sidecar entity maps 1:1 onto a DXF entity of its layer; no entity on a layer other than the three, and no entity on the writer's mandatory `0`/`Defpoints` layers | exact |
 
 DXF is read back through `ezdxf.recover.readfile` (which is also U4's audit
 check), so gates read what a CAD consumer reads.
@@ -97,9 +117,11 @@ check), so gates read what a CAD consumer reads.
 
 One artifact per end-to-end run: `overlay.png` — the input raster with the
 DXF geometry on top (`BOUNDARY_LINE` blue, `BOUNDARY_CURVE` red, label
-insertions as small crosses). `src/vectorjuju/overlay.py::write_overlay(page,
+insertions as small crosses). `tests/acceptance_helpers.py::write_overlay(page,
 dxf, sidecar, out)` inverts the sidecar transform with Pillow `ImageDraw`
 only: no matplotlib, no ezdxf drawing add-on, no image-comparison dependency.
+It is a test helper, not shipped code, so nothing in the package needs Pillow;
+the private-plat run imports it from the repo checkout.
 
 Where it lands: CI uploads `overlay-<media>.png` from the acceptance job
 (`if: always()`), and the PR that claims the MVP links it for review. Nothing
@@ -114,11 +136,10 @@ mechanical gate.
 ## Layering and files
 
 ```
-src/vectorjuju/overlay.py             write_overlay(); also used by the local plat run
-tests/conftest.py                     session-scoped synthetic sheet + per-media converted fixtures
+tests/conftest.py                     session-scoped synthetic sheet; per-media converted fixtures, one output dir each
 tests/test_convert_units.py           U1–U5, no OCR
 tests/test_convert_acceptance.py      A1–A11, OCR, pytest.mark.acceptance
-tests/acceptance_helpers.py           pt<->px<->cad, label classify, segment/arc comparison
+tests/acceptance_helpers.py           pt<->px<->cad, label classify, segment/arc comparison, write_overlay()
 ```
 
 Split rule: assertable against planted geometry or a pure function → unit.
@@ -128,11 +149,14 @@ Only properties of the full input→DXF path are acceptance gates.
 
 CI, every PR:
 
-- Unit gates in the existing job.
-- A dedicated `acceptance` job (ubuntu-latest) running all three media plus
-  the failure paths. Sheet generated once per session (~2 s), one `convert()`
-  per medium, docling model cache keyed to the pinned docling version. Target
-  ≤ 5 min wall; if exceeded, split the job, never move a medium to local-only.
+- Unit gates in the existing job, which becomes `pytest -m "not acceptance"`
+  (marker registered in `pyproject.toml`) so the OCR path runs once, in the
+  acceptance job.
+- A dedicated `acceptance` job (ubuntu-latest) running `pytest -m acceptance`
+  over all three media plus the failure paths. Sheet generated once per
+  session (~2 s), one `convert()` per medium, docling model cache keyed to the
+  pinned docling version. Target ≤ 5 min wall; if exceeded, split the job,
+  never move a medium to local-only.
 - `overlay-*.png` uploaded always.
 - **A skip is not a pass.** If the OCR engine cannot initialise in CI, the
   acceptance job fails. Linux/CPU OCR parity is the map's open question — the
@@ -147,8 +171,10 @@ Local, manual, uncommitted, following the issue-13 prototype's private-run
 convention: aggregate counts only, no recognized text, coordinates, crops, or
 the file itself ever reported.
 
-1. Work in `mktemp -d` outside the repo; all outputs (DXF, sidecar, overlay,
-   any crop) exist only there.
+1. Work in a directory outside the repo that removes itself on success, error,
+   and interrupt (`tempfile.TemporaryDirectory`, or an `EXIT`/`INT`/`TERM` trap
+   around `mktemp -d`); all outputs (DXF, sidecar, overlay, any crop) exist
+   only there.
 2. Run `convert()` with the plat's real `units` and no `scale` override —
    calibration must earn its result.
 3. Run twice; DXF and JSON must be byte-identical.
@@ -161,8 +187,8 @@ the file itself ever reported.
    the curve-table radii against fitted ARC radii (≤ 5 %); count labels bound
    vs unbound.
 6. Report only aggregates: sha256 prefix, pixel size, layer/entity counts,
-   bound/unbound label counts, failure categories. Delete the temp dir when
-   done.
+   bound/unbound label counts, failure categories — with the temp dir already
+   gone before anything is reported.
 7. Failures (uncalibratable, unreadable) are reported by category, not
    skipped silently.
 
@@ -173,8 +199,8 @@ repeatable rather than a vibe.
 
 `convert()` brings `ezdxf`, `numpy`, `docling`, and OpenCV as runtime
 dependencies; the suite adds none beyond those — `ezdxf` is what the gates
-reopen the DXF with, and `pillow`/`pypdfium2` are already dev dependencies.
-No matplotlib, no golden-image tooling.
+reopen the DXF with, and `pillow`/`pypdfium2` are already dev dependencies, the
+overlay helper included. No matplotlib, no golden-image tooling.
 
 ## Definition of done
 
