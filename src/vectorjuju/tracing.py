@@ -15,6 +15,7 @@ glyphs and monument marks.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from heapq import heappop, heappush
 
 import cv2
 import numpy as np
@@ -28,7 +29,6 @@ _REFERENCE_DPI = 200.0
 # synthetic sheet's 1.4 pt boundary strokes (~3.9 px) from its 0.6-1.0 pt
 # distractors (~1.7-2.8 px); the fixture test pins both sides of it.
 _MIN_STROKE_PX = 3.0
-_MIN_LENGTH_PX = 12.0
 _MIN_EXTENT_PX = 22.0
 _CHAIN_PRUNE_PX = 4.0
 _DASH_GAP_PX = 10.0
@@ -36,13 +36,16 @@ _DASH_ANGLE_DEG = 12.0
 _DASH_COLLINEAR_PX = 1.5
 _SIMPLIFY_PX = 1.5
 _CORNER_DEG = 15.0
+_SHARP_CORNER_DEG = 45.0
+_CORNER_ISOLATION = 3.0
 _JOIN_DEG = 75.0
 _DUPLICATE_PX = 2.0
+_WIDTH_STEP_PX = 0.1
 
 _OFFSETS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Run:
     """One traced straight run: a simplified polyline in raster px, y down."""
 
@@ -57,30 +60,50 @@ def trace_runs(
 ) -> list[Run]:
     """Trace boundary runs from a raster.
 
-    ``exclude_mask`` is a boolean array the size of the raster; true pixels are
-    removed before tracing (text boxes go here once OCR lands).
+    ``image`` is a PIL image or a 2-D uint8 grayscale array. ``exclude_mask``
+    is a boolean array the size of the raster; true pixels are removed before
+    tracing (text boxes go here once OCR lands).
     """
-    gray = np.asarray(image.convert("L") if isinstance(image, Image.Image) else image)
+    if dpi <= 0:
+        raise ValueError(f"dpi must be positive, got {dpi!r}")
+    if isinstance(image, Image.Image):
+        gray = np.asarray(image.convert("L"))
+    else:
+        gray = np.asarray(image)
+        if gray.ndim != 2 or gray.dtype != np.uint8:
+            raise ValueError(f"image array must be 2-D uint8 grayscale, got shape {gray.shape} dtype {gray.dtype}")
+    if gray.size == 0:
+        return []
+    if exclude_mask is not None and exclude_mask.shape != gray.shape:
+        raise ValueError(f"exclude_mask shape {exclude_mask.shape} does not match image shape {gray.shape}")
+    mask = exclude_mask.astype(bool) if exclude_mask is not None else None
     binary = _binarize(gray)
-    if exclude_mask is not None:
-        binary &= ~exclude_mask.astype(bool)
+    if mask is not None:
+        binary &= ~mask
+    if not binary.any() or binary.all():
+        return []  # nothing to trace, or a solid page that has no centreline to thin to
     # Ink coverage, not a binary width: anti-aliasing quantises px counts, but
     # the integrated coverage of a cross-section is the true stroke width.
-    coverage = (255.0 - gray.astype(float)) / 255.0
+    coverage = (255.0 - gray.astype(np.float32)) / 255.0
+    if mask is not None:
+        coverage[mask] = 0.0  # excluded ink must not measure as part of a remaining stroke
 
     min_stroke = _scaled(_MIN_STROKE_PX, dpi)
-    paths = [
-        path
+    measured = [
+        (path, _stroke_width(path, coverage, dpi))
         for path in _trace_paths(skeletonize(binary), _scaled(_CHAIN_PRUNE_PX, dpi))
-        if _stroke_width(path, coverage) >= min_stroke
     ]
-    paths = _drop_duplicates(paths, dpi)
-    spans = [path[span] for path in _merge_dashes(paths, dpi) for span in _split_at_corners(path, dpi)]
+    paths = _drop_duplicates([(path, width) for path, width in measured if width >= min_stroke], dpi)
+    spans = [
+        (path[span], width)
+        for path, width in _merge_dashes(paths, coverage, dpi)
+        for span in _split_at_corners(path, dpi)
+    ]
     # Merge again after splitting: a corner the trace crossed leaves a span
     # pair whose join is interior to the merged path.
     runs: list[Run] = []
-    for span in _merge_dashes(_drop_duplicates(spans, dpi), dpi):
-        if _is_distractor(span, coverage, dpi):
+    for span, width in _merge_dashes(_drop_duplicates(spans, dpi), coverage, dpi):
+        if _is_distractor(span, width, dpi):
             continue
         runs.append(Run(points_px=_simplify(span, dpi)))
     return runs
@@ -280,27 +303,81 @@ def _follow_chains(chains: list[np.ndarray], pairs: dict[tuple[int, bool], tuple
     return paths
 
 
-def _merge_dashes(paths: list[np.ndarray], dpi: float) -> list[np.ndarray]:
+def _merge_dashes(
+    entries: list[tuple[np.ndarray, float]], coverage: np.ndarray, dpi: float
+) -> list[tuple[np.ndarray, float]]:
     """Join collinear paths separated by a small gap into one run.
 
-    Only paths whose endpoints land in the same or adjacent cells are compared,
-    so the search stays linear in the fragment count. Greedy closest-pair-first:
-    merging the tightest collinear gap each round keeps a dash chain from
-    absorbing a merely nearby stroke.
+    Candidate pairs come from an endpoint grid, and the tightest collinear gap
+    is merged first, so a dash chain cannot absorb a merely nearby stroke.
+    Pending candidates sit in a heap and only pairs touching a merged path are
+    rebuilt: a chain of n fragments costs O(n log n), not n rescans of every
+    pair.
     """
-    remaining = [np.asarray(path, dtype=float) for path in paths]
-    gap_limit = _scaled(_DASH_GAP_PX, dpi)
-    while True:
-        best: tuple[float, int, int, np.ndarray, np.ndarray] | None = None
-        for i, j in _nearby_pairs(remaining, gap_limit):
-            merge = _merge_pair(remaining[i], remaining[j], dpi)
-            if merge is not None and (best is None or merge[0] < best[0]):
-                best = (merge[0], i, j, merge[1], merge[2])
-        if best is None:
-            return remaining
-        _, i, j, first, second = best
-        remaining = [path for k, path in enumerate(remaining) if k not in (i, j)]
-        remaining.append(np.vstack([first, second]))
+    paths = [np.asarray(path, dtype=float) for path, _ in entries]
+    widths = [width for _, width in entries]
+    grid = _scaled(_DASH_GAP_PX, dpi) + (max(widths) if widths else 0.0)
+    alive = [True] * len(paths)
+
+    def cell(point: np.ndarray) -> tuple[int, int]:
+        return (int(point[0] // grid), int(point[1] // grid))
+
+    buckets: dict[tuple[int, int], set[int]] = {}
+
+    def index_bucket(index: int) -> None:
+        for point in (paths[index][0], paths[index][-1]):
+            buckets.setdefault(cell(point), set()).add(index)
+
+    def drop_bucket(index: int) -> None:
+        for point in (paths[index][0], paths[index][-1]):
+            key = cell(point)
+            bucket = buckets.get(key)
+            if bucket is not None:
+                bucket.discard(index)
+                if not bucket:
+                    del buckets[key]
+
+    def neighbours(index: int) -> set[int]:
+        found: set[int] = set()
+        for point in (paths[index][0], paths[index][-1]):
+            col, row = cell(point)
+            for dc in (-1, 0, 1):
+                for dr in (-1, 0, 1):
+                    found.update(buckets.get((col + dc, row + dr), ()))
+        found.discard(index)
+        return found
+
+    def merge_result(i: int, j: int) -> tuple[float, np.ndarray, np.ndarray] | None:
+        return _merge_pair(paths[i], paths[j], dpi, min(widths[i], widths[j]))
+
+    heap: list[tuple[float, int, int]] = []
+    for index in range(len(paths)):
+        index_bucket(index)
+    for i, j in _nearby_pairs(paths, grid):
+        result = merge_result(i, j)
+        if result is not None:
+            heappush(heap, (result[0], i, j))
+    while heap:
+        _, i, j = heappop(heap)
+        if not (alive[i] and alive[j]):
+            continue
+        result = merge_result(i, j)
+        if result is None:
+            continue
+        _, first, second = result
+        alive[i] = alive[j] = False
+        drop_bucket(i)
+        drop_bucket(j)
+        paths.append(np.vstack([first, second]))
+        widths.append(_stroke_width(paths[-1], coverage, dpi))
+        alive.append(True)
+        index_bucket(len(paths) - 1)
+        for other in neighbours(len(paths) - 1):
+            if alive[other]:
+                extended = merge_result(len(paths) - 1, other)
+                if extended is not None:
+                    heappush(heap, (extended[0], len(paths) - 1, other))
+    return [(paths[i], widths[i]) for i in range(len(paths)) if alive[i]]
 
 
 def _nearby_pairs(paths: list[np.ndarray], limit: float) -> set[tuple[int, int]]:
@@ -320,29 +397,39 @@ def _nearby_pairs(paths: list[np.ndarray], limit: float) -> set[tuple[int, int]]
     return pairs
 
 
-def _merge_pair(a: np.ndarray, b: np.ndarray, dpi: float) -> tuple[float, np.ndarray, np.ndarray] | None:
-    """Orient a and b so a's end meets b's start, or None if they are not a dash gap."""
-    gap_limit = _scaled(_DASH_GAP_PX, dpi)
+def _merge_pair(
+    a: np.ndarray, b: np.ndarray, dpi: float, cap: float
+) -> tuple[float, np.ndarray, np.ndarray] | None:
+    """Orient a and b so a's end meets b's start, or None if they are not a dash gap.
+
+    ``cap`` is the stroke width the skeleton throws away at the two facing
+    ends, so the gap between skeleton endpoints is that much wider than the
+    ink gap.
+    """
+    gap_limit = _scaled(_DASH_GAP_PX, dpi) + cap
+    angle_limit = np.radians(_DASH_ANGLE_DEG)
+    cosine, tangent = np.cos(angle_limit), np.tan(angle_limit)
     collinear_limit = _scaled(_DASH_COLLINEAR_PX, dpi)
-    cosine = np.cos(np.radians(_DASH_ANGLE_DEG))
+    window = max(2, round(_scaled(15.0, dpi)))
     best: tuple[float, np.ndarray, np.ndarray] | None = None
     for reverse_a in (False, True):
         for reverse_b in (False, True):
-            first = a[::-1] if reverse_a else a
-            second = b[::-1] if reverse_b else b
-            tail, head = first[-1], second[0]
+            tail = a[0] if reverse_a else a[-1]
+            head = b[-1] if reverse_b else b[0]
             gap = float(np.hypot(*(head - tail)))
             if gap > gap_limit:
                 continue
-            outward = _end_direction(first, at_start=False)
-            inward = _end_direction(second, at_start=True)
+            outward = _end_direction(a, at_start=reverse_a, window=window)
+            inward = _end_direction(b, at_start=not reverse_b, window=window)
             # Both point away from the join, so a true dash gap looks opposite.
             if outward is None or inward is None or float(np.dot(outward, inward)) > -cosine:
                 continue
-            if abs(_cross(outward, head - tail)) > collinear_limit:
+            # A gap on a curve tilts the joining vector; allow the lateral
+            # offset that still fits the angle the pairing allows.
+            if abs(_cross(outward, head - tail)) > collinear_limit + gap * tangent:
                 continue
             if best is None or gap < best[0]:
-                best = (gap, first, second)
+                best = (gap, a[::-1] if reverse_a else a, b[::-1] if reverse_b else b)
     return best
 
 
@@ -371,8 +458,10 @@ def _split_at_corners(path: np.ndarray, dpi: float) -> list[np.ndarray]:
     """Index spans between corner vertices of the simplified trace.
 
     A closed parcel traces as one cycle; straight runs only exist after
-    splitting where the trace turns sharply. Arcs spread their turn evenly and
-    survive as a single span.
+    splitting where the trace turns sharply. The turn is measured over a short
+    window of the trace, not between neighbouring simplification vertices: a
+    smooth arc's vertices each carry a share of its curvature, and judging
+    those would shred the arc.
     """
     simplified = _simplify(path, dpi)
     if len(simplified) < 2:
@@ -381,10 +470,10 @@ def _split_at_corners(path: np.ndarray, dpi: float) -> list[np.ndarray]:
     # Simplification may drop the repeated closing vertex; keep it cyclically.
     closed_polygon = closed and len(simplified) > 3 and bool(np.allclose(simplified[0], simplified[-1]))
     polygon = simplified[:-1] if closed_polygon else simplified
-    corners = _corner_indices(polygon, closed)
-    if not corners:
+    markers = sorted(set(_corner_indices(path, polygon, closed, dpi)))
+    if not markers or len(markers) == 1:
+        # No corner, or one corner that closes the cycle, which is still one span.
         return [np.arange(len(path))]
-    markers = sorted({int(np.argmin(np.hypot(*(path - polygon[corner]).T))) for corner in corners})
     if not closed:
         cuts = [0, *markers, len(path) - 1]
         return [np.arange(cuts[k], cuts[k + 1] + 1) for k in range(len(cuts) - 1) if cuts[k + 1] > cuts[k]]
@@ -402,47 +491,83 @@ def _split_at_corners(path: np.ndarray, dpi: float) -> list[np.ndarray]:
     return spans
 
 
-def _corner_indices(polygon: np.ndarray, closed: bool) -> list[int]:
-    """Vertices where the trace turns more than ``_CORNER_DEG``."""
+def _corner_indices(path: np.ndarray, polygon: np.ndarray, closed: bool, dpi: float) -> list[int]:
+    """Indices where the trace turns sharply enough to end a straight run.
+
+    Directions are compared over a short window either side of each simplified
+    vertex, and only a turn the neighbouring vertices do not share counts: a
+    smooth arc's vertices each carry a similar slice of its curvature, so an
+    arc survives as one span while a corner between straighter runs splits.
+    """
+    points = path[:-1] if closed and np.allclose(path[0], path[-1]) else path
+    window = max(2, round(_scaled(4.0, dpi)))
     limit = np.radians(_CORNER_DEG)
-    corners = []
-    for k in range(len(polygon)):
+    sharp = np.radians(_SHARP_CORNER_DEG)
+    measured: list[tuple[int, float]] = []  # (path index, absolute turn), in polygon order
+    for k, vertex in enumerate(polygon):
         if not closed and k in (0, len(polygon) - 1):
             continue
-        incoming = polygon[k] - polygon[k - 1]
-        outgoing = polygon[(k + 1) % len(polygon)] - polygon[k]
+        index = int(np.argmin(np.hypot(points[:, 0] - vertex[0], points[:, 1] - vertex[1])))
+        before = points[(index - window) % len(points)] if closed else points[max(0, index - window)]
+        after = points[(index + window) % len(points)] if closed else points[min(len(points) - 1, index + window)]
+        incoming, outgoing = points[index] - before, after - points[index]
         if np.hypot(*incoming) == 0 or np.hypot(*outgoing) == 0:
             continue
-        turn = np.arctan2(_cross(incoming, outgoing), float(np.dot(incoming, outgoing)))
-        if abs(turn) > limit:
-            corners.append(k)
+        measured.append((index, abs(float(np.arctan2(_cross(incoming, outgoing), float(np.dot(incoming, outgoing)))))))
+    corners = []
+    for position, (index, turn) in enumerate(measured):
+        if turn <= limit:
+            continue
+        left = measured[position - 1][1] if position > 0 else (measured[-1][1] if closed and len(measured) > 1 else 0.0)
+        right = (
+            measured[position + 1][1]
+            if position + 1 < len(measured)
+            else (measured[0][1] if closed and len(measured) > 1 else 0.0)
+        )
+        if turn > sharp or turn > _CORNER_ISOLATION * max(left, right):
+            corners.append(index)
     return corners
 
 
-def _drop_duplicates(paths: list[np.ndarray], dpi: float) -> list[np.ndarray]:
+def _drop_duplicates(entries: list[tuple[np.ndarray, float]], dpi: float) -> list[tuple[np.ndarray, float]]:
     """Drop runs that run alongside a substantially longer one.
 
     Thinning leaves staircase rungs next to the centreline it just walked; a
     run whose points mostly sit within a stroke width of a much longer run is
     that leftover (or an outline traced beside its twin), not a second line.
-    Dashes survive: only their ends come near the neighbouring dash.
+    Dashes survive: only their ends come near the neighbouring dash. Kept
+    bounding boxes are bucketed so a page of varied-length runs is not an
+    all-pairs comparison.
     """
     tolerance = _scaled(_DUPLICATE_PX, dpi)
-    kept: list[np.ndarray] = []
+    cell = max(tolerance, _scaled(32.0, dpi))
+    kept: list[tuple[np.ndarray, float]] = []
     lengths: list[float] = []
-    for path in sorted(paths, key=_arc_length, reverse=True):
+    index: dict[tuple[int, int], list[int]] = {}
+    for path, width in sorted(entries, key=lambda entry: _arc_length(entry[0]), reverse=True):
         length = _arc_length(path)
-        box = _bbox(path, tolerance)
+        query = _bbox(path, 2.0 * tolerance)
+        candidates: set[int] = set()
+        for col in range(int(query[0] // cell), int(query[2] // cell) + 1):
+            for row in range(int(query[1] // cell), int(query[3] // cell) + 1):
+                candidates.update(index.get((col, row), ()))
         duplicate = False
-        for longer, longer_length in zip(kept, lengths):
-            if longer_length < 2.0 * length:
-                break  # kept is longest-first
-            if _boxes_overlap(box, _bbox(longer, tolerance)) and _runs_alongside(path, longer, tolerance):
+        for k in candidates:
+            if lengths[k] < 2.0 * length:
+                continue
+            if _boxes_overlap(_bbox(path, tolerance), _bbox(kept[k][0], tolerance)) and _runs_alongside(
+                path, kept[k][0], tolerance
+            ):
                 duplicate = True
                 break
-        if not duplicate:
-            kept.append(path)
-            lengths.append(length)
+        if duplicate:
+            continue
+        kept.append((path, width))
+        lengths.append(length)
+        raw = _bbox(path, 0.0)
+        for col in range(int(raw[0] // cell), int(raw[2] // cell) + 1):
+            for row in range(int(raw[1] // cell), int(raw[3] // cell) + 1):
+                index.setdefault((col, row), []).append(len(kept) - 1)
     return kept
 
 
@@ -471,15 +596,17 @@ def _runs_alongside(short: np.ndarray, long: np.ndarray, tolerance: float) -> bo
     return nearby / len(sample) >= 0.8
 
 
-def _stroke_width(points: np.ndarray, coverage: np.ndarray, *, sections: int = 20, half: float = 4.0) -> float:
+def _stroke_width(points: np.ndarray, coverage: np.ndarray, dpi: float, *, sections: int = 20) -> float:
     """Ink width across the run, in px, as the lower quartile of cross-sections.
 
     The lower quartile keeps a section that clips a crossing stroke or a
-    neighbouring glyph from inflating the estimate for the whole run.
+    neighbouring glyph from inflating the estimate for the whole run. Window
+    and step scale with dpi, or a stroke reads narrower than it is above the
+    reference resolution.
     """
     if len(points) < 2:
         return 0.0
-    step = 0.25
+    half, step = _scaled(4.0, dpi), _scaled(_WIDTH_STEP_PX, dpi)
     offsets = np.arange(-half, half + step / 2, step)
     widths = []
     for index in np.linspace(0, len(points) - 1, min(sections, len(points))).astype(int):
@@ -495,13 +622,15 @@ def _stroke_width(points: np.ndarray, coverage: np.ndarray, *, sections: int = 2
     return float(np.percentile(widths, 25)) if widths else 0.0
 
 
-def _is_distractor(points: np.ndarray, coverage: np.ndarray, dpi: float) -> bool:
+def _is_distractor(points: np.ndarray, width: float, dpi: float) -> bool:
     """Thin or tiny linework: right-of-way lines, table borders, glyphs, monuments."""
-    if _stroke_width(points, coverage) < _scaled(_MIN_STROKE_PX, dpi):
+    if width < _scaled(_MIN_STROKE_PX, dpi):
         return True
-    if float(np.hypot(np.ptp(points[:, 0]), np.ptp(points[:, 1]))) < _scaled(_MIN_EXTENT_PX, dpi):
-        return True
-    return _arc_length(points) < _scaled(_MIN_LENGTH_PX, dpi)
+    # The skeleton stops about half a stroke width short of each end, so allow
+    # that ink back before calling a short run a monument mark.
+    allowance = min(2.0 * width, _scaled(_MIN_EXTENT_PX / 2.0, dpi))
+    extent = float(np.hypot(np.ptp(points[:, 0]), np.ptp(points[:, 1])))
+    return extent < _scaled(_MIN_EXTENT_PX, dpi) - allowance
 
 
 def _arc_length(points: np.ndarray) -> float:
