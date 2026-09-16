@@ -17,6 +17,8 @@ from pathlib import Path
 import pypdfium2 as pdfium
 from PIL import Image, ImageOps
 
+from vectorjuju.errors import VectorjujuError
+
 RASTER_SUFFIXES = frozenset({".jpg", ".jpeg", ".tif", ".tiff"})
 _RASTER_FORMATS = frozenset({"JPEG", "MPO", "TIFF"})
 _PDF_SUFFIX = ".pdf"
@@ -25,10 +27,6 @@ _PDF_SUFFIX = ".pdf"
 # Ingest peaks near 12 bytes/pixel (decoded, transposed, and RGB buffers), so
 # cap accepted rasters at 256 MiB of peak allocations (~22M pixels).
 MAX_INGEST_PIXELS = 256 * 1024 * 1024 // 12
-
-
-class VectorjujuError(Exception):
-    """Base class for vectorjuju errors."""
 
 
 class UnsupportedInputError(VectorjujuError):
