@@ -13,10 +13,10 @@ inside the stroke, not at the centreline intersection, which is the slop the
 acceptance suite's 8 px end-reach gates allow. Its raw length therefore
 overshoots the scale by a few percent, so each end is first extended to the
 intersection with the neighbouring bound run's centreline -- corner-to-corner
-is what a recorded distance measures. That extension is measurement-only;
-the emitted geometry keeps the tracer's own endpoints. A cell index keeps
-each end's search on the runs whose geometry is actually near it, so closure
-costs per run, not per run pair.
+is what a recorded distance measures. ``tracing.join_corners`` applies the
+same closure to the geometry ``convert()`` emits, so the drawing and this
+measurement agree. A cell index keeps each end's search on the runs whose
+geometry is actually near it, so closure costs per run, not per run pair.
 
 Nothing unbound reaches here, so curve-table cells (which never bind: a
 radius has no bearing, and their borders are rejected by the tracer) cannot
@@ -36,7 +36,7 @@ import numpy as np
 from vectorjuju.convert import _require_fpp
 from vectorjuju.errors import VectorjujuError
 from vectorjuju.text import BoundCall
-from vectorjuju.tracing import Run, _end_direction
+from vectorjuju.tracing import _CORNER_CLOSE_PX, Run, _cell_index, _closes_end, _nearby_runs
 
 _REFERENCE_DPI = 200.0
 # Prior art: RANSAC needs at least three bound distance calls -- a consensus
@@ -52,14 +52,6 @@ _INLIER_REL_TOL = 0.03
 # only grow, so this converges in a few passes; the cap makes termination
 # independent of any floating-point tie-break.
 _MAX_REFINEMENTS = 8
-# Skeleton junction vertices stop ~5-8 px short of a corner at the reference
-# dpi (A7's end-reach slop), and the neighbouring run is short too, so closing
-# an end may travel up to the sum of both shortfalls. 16 px covers that with
-# headroom while staying far inside the distance between real boundary runs.
-_CORNER_EXTEND_PX = 16.0
-# A neighbour whose centreline is nearly parallel is a merged dash or an
-# offset line, not a corner; the tracer's own corner threshold is 15 degrees.
-_CORNER_SIN = math.sin(math.radians(15.0))
 
 
 class ScaleCalibrationError(VectorjujuError):
@@ -81,81 +73,6 @@ class Scale:
 
 def _scaled(px_at_reference_dpi: float, dpi: float) -> float:
     return px_at_reference_dpi * dpi / _REFERENCE_DPI
-
-
-def _closest_point(point: np.ndarray, points: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
-    """Distance to a polyline, its nearest point, and that segment's unit direction."""
-    best = (math.inf, point, np.zeros(2))
-    for a, b in pairwise(points):
-        edge = b - a
-        length = float(np.hypot(*edge))
-        if length == 0:
-            continue
-        t = max(0.0, min(1.0, float((point - a) @ edge) / (length * length)))
-        nearest = a + t * edge
-        distance = float(np.linalg.norm(point - nearest))
-        if distance < best[0]:
-            best = (distance, nearest, edge / length)
-    return best
-
-
-def _closes_end(points: np.ndarray, at_start: bool, neighbours: Sequence[np.ndarray], cap: float) -> np.ndarray:
-    """Extend one run end to its corner.
-
-    Intersects the run's outward end ray with each neighbour's centreline and
-    takes the smallest valid crossing; the end is returned unchanged when no
-    neighbour meets it inside the cap.
-    """
-    end = points[0] if at_start else points[-1]
-    direction = _end_direction(points, at_start)
-    if direction is None:
-        return end
-    best: tuple[float, np.ndarray | None] = (math.inf, None)
-    for neighbour in neighbours:
-        distance, nearest, edge = _closest_point(end, neighbour)
-        if distance > 2 * cap or abs(direction[0] * edge[1] - direction[1] * edge[0]) < _CORNER_SIN:
-            continue
-        try:
-            along, across = np.linalg.solve(
-                np.array([[direction[0], -edge[0]], [direction[1], -edge[1]]]), nearest - end
-            )
-        except np.linalg.LinAlgError:  # parallel, already guarded; keep the degenerate safe
-            continue
-        if 0.0 < along <= cap and abs(across) <= cap and along < best[0]:
-            best = (float(along), end + along * direction)
-    return best[1] if best[1] is not None else end
-
-
-def _cell_index(runs: Sequence[Run], cell_px: float) -> dict[tuple[int, int], list[int]]:
-    """Run indices by raster cell, so closure looks up neighbours instead of
-    scanning every other run's polyline at every end."""
-    index: dict[tuple[int, int], list[int]] = {}
-    for i, run in enumerate(runs):
-        for a, b in pairwise(run.points_px):
-            x0, x1 = min(float(a[0]), float(b[0])), max(float(a[0]), float(b[0]))
-            y0, y1 = min(float(a[1]), float(b[1])), max(float(a[1]), float(b[1]))
-            for cx in range(int(x0 // cell_px), int(x1 // cell_px) + 1):
-                for cy in range(int(y0 // cell_px), int(y1 // cell_px) + 1):
-                    index.setdefault((cx, cy), []).append(i)
-    return index
-
-
-def _nearby_runs(
-    index: dict[tuple[int, int], list[int]], cell_px: float, point: np.ndarray, runs: Sequence[Run], skip: int
-) -> list[np.ndarray]:
-    """Polylines of the runs in the 3x3 cell block around ``point``.
-
-    The cell is twice the closure cap, so every run whose centreline comes
-    within reach of ``point`` -- the only ones ``_closes_end`` can use -- is
-    inside that block.
-    """
-    cx, cy = int(point[0] // cell_px), int(point[1] // cell_px)
-    near: set[int] = set()
-    for dx in (-1, 0, 1):
-        for dy in (-1, 0, 1):
-            near.update(index.get((cx + dx, cy + dy), ()))
-    near.discard(skip)
-    return [runs[i].points_px for i in sorted(near)]
 
 
 def _closed_run_length_px(
@@ -183,7 +100,7 @@ def _usable_samples(bound_calls: Sequence[BoundCall], dpi: float) -> list[tuple[
     divides by zero; both are skipped, not guessed at.
     """
     runs = [bound.run for bound in bound_calls]
-    cap = _scaled(_CORNER_EXTEND_PX, dpi)
+    cap = _scaled(_CORNER_CLOSE_PX, dpi)
     index = _cell_index(runs, 2 * cap)
     samples = []
     for i, bound in enumerate(bound_calls):

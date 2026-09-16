@@ -507,8 +507,8 @@ def test_bind_calls_collapses_duplicate_reads_of_one_call() -> None:
     assert unbound == []
     assert len(bound) == 2
     by_call = {bc.call.raw_text: bc.run for bc in bound}
-    assert by_call[call] is run1  # page geometry kept; crop duplicate dropped
-    assert by_call[other.text] is run2
+    assert by_call[normalize_ocr(call)] is run1  # page geometry kept; crop duplicate dropped
+    assert by_call[normalize_ocr(other.text)] is run2
 
 
 def test_bind_calls_collapses_a_chain_of_overlapping_duplicate_reads() -> None:
@@ -529,8 +529,8 @@ def test_bind_calls_collapses_a_chain_of_overlapping_duplicate_reads() -> None:
     assert unbound == []
     assert len(bound) == 2
     by_call = {bc.call.raw_text: bc.run for bc in bound}
-    assert by_call[call] is run1  # page geometry kept; both crop duplicates dropped
-    assert by_call[other.text] is run2
+    assert by_call[normalize_ocr(call)] is run1  # page geometry kept; both crop duplicates dropped
+    assert by_call[normalize_ocr(other.text)] is run2
 
 
 def test_bind_calls_is_deterministic() -> None:

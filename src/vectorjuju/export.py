@@ -18,17 +18,14 @@ import math
 import threading
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Literal
 
 import ezdxf
 
 from vectorjuju.calibrate import Scale
-from vectorjuju.convert import _require_fpp, _require_img_height, px_to_cad
+from vectorjuju.convert import Units, _require_fpp, _require_img_height, px_to_cad
 from vectorjuju.curves import CircleFit, classify
 from vectorjuju.text import BoundCall, ParsedCall, TextItem
 from vectorjuju.tracing import Run
-
-Units = Literal["us-survey-foot", "international-foot", "metre"]
 
 LAYERS = ("BOUNDARY_LINE", "BOUNDARY_CURVE", "LABEL")
 INSUNITS: dict[str, int] = {"us-survey-foot": 21, "international-foot": 2, "metre": 6}
@@ -119,8 +116,8 @@ def write_outputs(
 
         # Labels last, so the boundary entities above and the sidecar's
         # entities[] line up index for index.
-        for call, item, cad in held:
-            _draw_label(msp, item, cad, char_height, to_cad)
+        for parsed, item, cad in held:
+            _draw_label(msp, parsed.raw_text, item, cad, char_height, to_cad)
         unbound_text = [
             {"raw_text": item.text, "insertion": list(to_cad(_box_center(item.box_px)))} for item in unbound
         ]
@@ -184,11 +181,16 @@ def _draw_boundary(
             spline.closed = True
 
 
-def _draw_label(msp, item: TextItem, cad: list[list[float]], char_height: float, to_cad) -> None:
+def _draw_label(msp, text: str, item: TextItem, cad: list[list[float]], char_height: float, to_cad) -> None:
     """One MTEXT at the label's own OCR position, middle-centered so the
-    insertion point is the text box's centre however the text is rotated."""
+    insertion point is the text box's centre however the text is rotated.
+
+    ``text`` is the parsed call's transcription (``ParsedCall.raw_text``),
+    which is also what the sidecar records: the drawing must not show a unit
+    mark the parser already corrected.
+    """
     mtext = msp.add_mtext(
-        item.text,
+        text,
         dxfattribs={
             "layer": "LABEL",
             "rotation": _run_rotation(cad),

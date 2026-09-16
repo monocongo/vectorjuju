@@ -134,13 +134,20 @@ def parse_call(raw: str) -> ParsedCall | None:
     bare ``C<n>``; that single rule rejects every curve-table cell for free
     (a radius cell has no bearing, a chord-bearing cell has no distance,
     ``PARCEL 5``/``LOT 12`` have neither) without special-casing any of them.
+
+    ``ParsedCall.raw_text`` is the call as it should be transcribed: unit
+    marks the parser positioned itself are written in their canonical form
+    (a ``'`` misread as ``"`` or ``*`` becomes ``'``), and OCR noise glued
+    onto the call's boundary -- tolerated above so a real read is not thrown
+    away -- is not carried along. Each correction is recorded in
+    ``suspect_tokens``; the untouched read stays on the ``TextItem``.
     """
     text = normalize_ocr(raw)
 
     curve = _CURVE_REF_RE.fullmatch(text)
     if curve:
         return ParsedCall(
-            raw_text=raw,
+            raw_text=f"C{curve.group(1)}",
             kind="curve_ref",
             bearing_deg=None,
             distance_ft=None,
@@ -195,8 +202,15 @@ def parse_call(raw: str) -> ParsedCall | None:
     if distance_match.group(2) != "'":
         suspects.append("foot-mark")
 
+    canonical = f"{q1} {deg}°"
+    if minutes is not None:
+        canonical += f"{minutes}'"
+    if seconds is not None:
+        canonical += f'{seconds}"'
+    canonical += f" {q2} {distance_match.group(1)}'"
+
     return ParsedCall(
-        raw_text=raw,
+        raw_text=canonical,
         kind="bearing_distance",
         bearing_deg=_azimuth(q1, q2, angle),
         distance_ft=float(distance_match.group(1)),

@@ -11,7 +11,7 @@ import math
 import numpy as np
 import pytest
 
-from vectorjuju import calibrate
+from vectorjuju import tracing
 from vectorjuju.calibrate import Scale, ScaleCalibrationError, _consensus, _ransac_fpp, calibrate_scale
 from vectorjuju.convert import VectorjujuError
 from vectorjuju.synthetic_plat import (
@@ -145,13 +145,13 @@ def test_corner_closure_does_not_scan_distant_runs(monkeypatch: pytest.MonkeyPat
     # every end scanning every run's full polyline is the quadratic blow-up.
     far = _bound_call(f"N 0°00'00\" E  {100.0:.2f}'", [(6000.0, 6000.0), (6400.0, 6000.0)])
     scanned: list[np.ndarray] = []
-    closest_point = calibrate._closest_point
+    closest_point = tracing._closest_point
 
     def spy(point: np.ndarray, points: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
         scanned.append(points)
         return closest_point(point, points)
 
-    monkeypatch.setattr(calibrate, "_closest_point", spy)
+    monkeypatch.setattr(tracing, "_closest_point", spy)
 
     scale = calibrate_scale([*_trimmed_square_calls(), far])
 
