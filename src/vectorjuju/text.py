@@ -495,12 +495,16 @@ def bind_calls(
             for item_index, _ in callable_items
         ]
     )
-    # Any in-gate assignment must always beat any out-of-gate one, so the
-    # solver never prefers a far run over a near one just to keep every row
-    # filled -- it only reaches for a penalty cell when an item has nothing
-    # better left, and that assignment is then dropped by the gate check below.
+    # A penalty cell must cost more than a whole fully in-gate assignment can
+    # total -- at most min(rows, cols) cells, each at most `gate` -- not
+    # merely more than the largest pairwise distance. Otherwise the solver can
+    # buy cheap rows elsewhere with one penalty cell, beat a complete valid
+    # matching on total cost, and the gate check below then drops that row even
+    # though a real match existed. The `finite` fallback keeps an all-infinite
+    # matrix (no finite candidate anywhere) from raising on an empty max.
     finite = distances[np.isfinite(distances)]
-    penalty = (float(finite.max()) if finite.size else 0.0) + gate * 2.0 + 1.0
+    largest = float(finite.max()) if finite.size else 0.0
+    penalty = max(largest, gate) * min(distances.shape) + 1.0
     cost = np.where(distances <= gate, distances, penalty)
     row_index, col_index = linear_sum_assignment(cost)
 

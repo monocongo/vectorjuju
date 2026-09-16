@@ -451,6 +451,45 @@ def test_bind_calls_leaves_a_loser_unbound_not_force_bound_elsewhere() -> None:
     assert unbound == [item_a]  # run1's loser: no other in-gate run existed
 
 
+def test_bind_calls_penalty_exceeds_a_whole_valid_matching_not_just_one_distance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a penalty larger only than the biggest single distance let
+    the solver buy cheap rows with one penalty cell and beat a complete in-gate
+    matching on total cost -- the gate check then dropped a bindable row.
+
+    All spans are infinite (invalid) except the 59px diagonal (the only
+    complete in-gate matching, 236px total) and a 0.1px chain that leaves one
+    row needing a penalty cell. The penalty must exceed 236px, so the 60px
+    gate is the floor: 60 * 4 + 1. The old max-distance + 2*gate + 1 = 180px
+    penalty lost (180.3 < 236) and returned one item unbound.
+    """
+    gate = 60.0  # _BIND_RADIUS_PX at the 200dpi reference
+    size = 4
+    distances = np.full((size, size), np.inf)
+    for i in range(size):
+        distances[i, i] = gate - 1.0
+    for i in range(1, size):
+        distances[i, i - 1] = 0.1
+    runs = [_run([(0.0, 0.0), (1.0, 0.0)]) for _ in range(size)]
+    items = [
+        TextItem(text="N 90°00'00\" E  200.00'", box_px=(float(i), 0.0, float(i) + 1.0, 1.0), source="page")
+        for i in range(size)
+    ]
+    columns = {id(run): index for index, run in enumerate(runs)}
+    monkeypatch.setattr(
+        text_module,
+        "_point_run_distance",
+        lambda point, run: float(distances[int(point[0])][columns[id(run)]]),
+    )
+
+    bound, unbound = bind_calls(runs, items, dpi=200.0)
+
+    assert unbound == []
+    assert [b.item for b in bound] == items
+    assert [b.run for b in bound] == runs
+
+
 def test_bind_calls_is_deterministic() -> None:
     boundary = _run([(0.0, 0.0), (200.0, 0.0)])
     other = _run([(0.0, 300.0), (200.0, 300.0)])
