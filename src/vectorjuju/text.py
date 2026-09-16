@@ -254,9 +254,15 @@ def _center(box: tuple[float, float, float, float]) -> tuple[float, float]:
 
 @lru_cache(maxsize=1)
 def _converter():
-    from docling.document_converter import DocumentConverter
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import OcrAutoOptions, PdfPipelineOptions
+    from docling.document_converter import DocumentConverter, ImageFormatOption
 
-    return DocumentConverter()
+    # scale=1.0: OCR inputs are already pre-scaled by _ocr_image, so docling
+    # must not resample them a second time; it still resolves the engine the
+    # same way (ocrmac on macOS, RapidOCR elsewhere).
+    options = PdfPipelineOptions(ocr_options=OcrAutoOptions(scale=1.0))
+    return DocumentConverter(format_options={InputFormat.IMAGE: ImageFormatOption(pipeline_options=options)})
 
 
 def _convert_path(path: Path):
@@ -271,14 +277,44 @@ def _convert_path(path: Path):
         return None
 
 
-def _doc_items(doc, height: int, source: str) -> list[TextItem]:
+# OCR input scale. The fixture's 7.5 pt labels are ~21 px tall at the
+# reference 200 dpi, and both engines misread their distance digits there
+# (RapidOCR dropped a decimal point or a digit on Linux; ocrmac's reads are
+# stable but lossy). Handing the engines a LANCZOS pre-scale instead of
+# docling's own default 3.0x resample fixes the reads on both, and pixel-wise
+# it is cheaper than the default it replaces. Capped so a large sheet cannot
+# blow up the OCR buffer; a page already over the cap is passed through.
+_OCR_UPSCALE = 2.0
+_OCR_MAX_PIXELS = 24_000_000
+
+
+def _ocr_image(image: Image.Image) -> tuple[Image.Image, float]:
+    """The image handed to OCR, and the factor its pixels were scaled by."""
+    factor = min(_OCR_UPSCALE, math.sqrt(_OCR_MAX_PIXELS / (image.width * image.height)))
+    if factor <= 1.0:
+        return image, 1.0
+    return image.resize((round(image.width * factor), round(image.height * factor)), Image.LANCZOS), factor
+
+
+def _doc_items(doc, height: int, source: str, factor: float = 1.0) -> list[TextItem]:
+    """One TextItem per docling text region, boxes back in the caller's pixels.
+
+    ``height`` is the OCR image's own height and ``factor`` the scale
+    ``_ocr_image`` applied, so boxes come back in the image the caller has.
+    """
     items = []
     for t in doc.texts:
         if not t.prov or not t.text.strip():
             continue
         b = t.prov[0].bbox
         top, bottom = max(b.t, b.b), min(b.t, b.b)  # docling: bottom-left origin
-        items.append(TextItem(text=t.text, box_px=(b.l, height - top, b.r, height - bottom), source=source))
+        items.append(
+            TextItem(
+                text=t.text,
+                box_px=(b.l / factor, (height - top) / factor, b.r / factor, (height - bottom) / factor),
+                source=source,
+            )
+        )
     return items
 
 
@@ -290,14 +326,14 @@ def page_items(image: Image.Image) -> list[TextItem]:
     ``extract_text(..., page_items=...)`` (after) to run this page-pass once
     instead of once per call.
     """
-    page_h = image.size[1]
+    ocr, factor = _ocr_image(image)
     with TemporaryDirectory() as tmp:
         path = Path(tmp) / "page.png"
-        image.save(path, format="PNG")
+        ocr.save(path, format="PNG")
         doc = _convert_path(path)
     if doc is None:
         return []
-    return _doc_items(doc, page_h, "page")
+    return _doc_items(doc, ocr.size[1], "page", factor)
 
 
 _page_items = page_items  # internal alias: extract_text's page_items kwarg shadows the module-level name
@@ -341,13 +377,14 @@ def warp_band(
 def _ocr_band(band: Image.Image) -> tuple[str, tuple[float, float, float, float] | None]:
     """OCR one band; returns its text and the band-local bbox spanning every
     OCR'd text region that contributed to it (``None`` if none did)."""
+    ocr, factor = _ocr_image(band)
     with TemporaryDirectory() as tmp:
         path = Path(tmp) / "band.png"
-        band.save(path, format="PNG")
+        ocr.save(path, format="PNG")
         doc = _convert_path(path)
     if doc is None:
         return "", None
-    items = _doc_items(doc, band.size[1], "crop")
+    items = _doc_items(doc, ocr.size[1], "crop", factor)
     text = " ".join(item.text for item in items)
     if not items:
         return text, None
