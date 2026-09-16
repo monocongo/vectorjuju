@@ -1,13 +1,16 @@
-"""A7 at the run level, on the synthetic plat fixture.
+"""Run-level gates on the synthetic plat fixture: A7 plus the curve half of U3/A4.
 
-The full acceptance suite reads A7 off a DXF; until `convert()` emits one (issue
-#22), the same properties are asserted over traced runs in raster px: one run
-per planted straight edge, reaching its endpoints, with no second parallel run
-and nothing on the right-of-way distractors.
+The full acceptance suite reads A7 and A4 off a DXF; until `convert()` emits
+one (issue #22), the same properties are asserted over traced runs in raster
+px: one run per planted straight edge, reaching its endpoints, with no second
+parallel run and nothing on the right-of-way distractors; the two planted arcs
+classify as circles with the right radius, endpoints, and bulge; the curve
+table never traces as geometry.
 """
 
 from __future__ import annotations
 
+import math
 from itertools import pairwise
 from pathlib import Path
 
@@ -15,7 +18,8 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from vectorjuju.synthetic_plat import PAGE_H, RENDER_DPI, generate_sheet
+from vectorjuju.curves import CircleFit, classify
+from vectorjuju.synthetic_plat import PAGE_H, RENDER_DPI, SCALE_PT_PER_FT, generate_sheet
 from vectorjuju.tracing import Run, trace_runs
 
 
@@ -66,6 +70,28 @@ def edge_hits(
     return hits
 
 
+def endpoint_reach(points: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+    """Worst end distance of the better start/end assignment to (a, b)."""
+    forward = max(np.hypot(*(points[0] - a)), np.hypot(*(points[-1] - b)))
+    backward = max(np.hypot(*(points[0] - b)), np.hypot(*(points[-1] - a)))
+    return float(min(forward, backward))
+
+
+def arc_midpoint(points: np.ndarray, fit: CircleFit) -> np.ndarray:
+    """Point halfway along the fitted sweep from the run's start to its end."""
+    centre = np.asarray(fit.center_px)
+    start = math.atan2(points[0][1] - centre[1], points[0][0] - centre[0])
+    end = math.atan2(points[-1][1] - centre[1], points[-1][0] - centre[0])
+    if fit.clockwise:  # increasing raster angle turns clockwise on the page
+        while end <= start:
+            end += 2 * math.pi
+    else:
+        while end >= start:
+            end -= 2 * math.pi
+    angle = (start + end) / 2
+    return centre + fit.radius_px * np.array([math.cos(angle), math.sin(angle)])
+
+
 def test_exactly_one_run_per_straight_edge(plat: tuple[list[Run], dict]):
     runs, truth = plat
     straight = [segment for segment in truth["segments"] if segment["kind"] == "straight"]
@@ -96,3 +122,55 @@ def test_no_primitive_on_offset_lines(plat: tuple[list[Run], dict]):
             if interior.sum() == 0:
                 continue
             assert np.all(distance[interior] > 3.0), f"{line['id']} traced as geometry"
+
+
+def test_planted_arcs_classify_as_circles(plat: tuple[list[Run], dict]):
+    """A4 at run level: the two planted arcs become circle fits and nothing else does.
+
+    Radius, endpoint, and bulge gates match the acceptance suite's; the 4 px
+    endpoint check is the fitted circle against the traced run's own ends here,
+    because A4's 4 px against the planted corners needs the arc/line endpoint
+    joining that lands with entity assembly in issue #22 (the traced ends sit
+    inside A7's 8 px corner-splitting slop).
+    """
+    runs, truth = plat
+    classified = [classify(run.points_px, RENDER_DPI) for run in runs]
+    curves = [(index, fit) for index, (kind, fit) in enumerate(classified) if kind == "curve"]
+
+    assert len(curves) == 2  # the fixture plants two arcs
+    assert all(fit is not None for _, fit in curves)  # so the writer emits zero SPLINE
+
+    radii_ft = {curve["id"]: curve["radius_ft"] for curve in truth["curves"]}
+    anchors = {label["segment_id"]: label["anchor_pt"] for label in truth["labels"] if label["kind"] == "curve_ref"}
+    matched = []
+    for segment in (segment for segment in truth["segments"] if segment["kind"] == "curve"):
+        a, b = to_px(segment["start_pt"]), to_px(segment["end_pt"])
+        hits = [(index, fit) for index, fit in curves if endpoint_reach(runs[index].points_px, a, b) <= 8.0]
+        assert len(hits) == 1, f"{segment['id']}: {len(hits)} curve runs reach it"
+        index, fit = hits[0]
+        assert fit is not None
+        matched.append(index)
+
+        radius_px = radii_ft[segment["curve_id"]] * SCALE_PT_PER_FT * RENDER_DPI / 72.0
+        assert abs(fit.radius_px - radius_px) / radius_px <= 0.03, segment["id"]
+        for end in (runs[index].points_px[0], runs[index].points_px[-1]):
+            centre = np.asarray(fit.center_px)
+            assert abs(float(np.hypot(*(end - centre))) - fit.radius_px) <= 4.0
+        anchor = to_px(anchors[segment["id"]])
+        assert np.hypot(*(arc_midpoint(runs[index].points_px, fit) - anchor)) <= 8.0
+    assert len(set(matched)) == 2  # each arc claims its own run
+
+
+def test_no_run_follows_the_curve_table_border(plat: tuple[list[Run], dict]):
+    """No traced run touches the table: its 0.7 pt borders and cell text stay out."""
+    runs, truth = plat
+    x0, y0, x1, y1 = truth["curve_table_bbox_pt"]
+    corners = [to_px([x, y]) for x in (x0, x1) for y in (y0, y1)]
+    left, right = min(corner[0] for corner in corners), max(corner[0] for corner in corners)
+    top, bottom = min(corner[1] for corner in corners), max(corner[1] for corner in corners)
+
+    for run in runs:
+        points = densify(run.points_px)
+        dx = np.maximum(np.maximum(left - points[:, 0], points[:, 0] - right), 0.0)
+        dy = np.maximum(np.maximum(top - points[:, 1], points[:, 1] - bottom), 0.0)
+        assert np.all(np.hypot(dx, dy) > 3.0), "a traced run reaches the curve table"
