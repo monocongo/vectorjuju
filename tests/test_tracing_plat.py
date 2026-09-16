@@ -149,7 +149,13 @@ def test_planted_arcs_classify_as_circles(plat: tuple[list[Run], dict]):
 
 
 def test_no_run_follows_the_curve_table_border(plat: tuple[list[Run], dict]):
-    """No traced run touches the table: its 0.7 pt borders and cell text stay out."""
+    """No traced run touches the table: its 0.7 pt borders and cell text stay out.
+
+    The 0.7 pt border is already under the tracer's stroke-width gate, so this
+    is the canary for that rejection: a border run that ever got through would
+    land inside or within 3 px of the table box. The DXF-level gate lands with
+    issue #22.
+    """
     runs, truth = plat
     x0, y0, x1, y1 = truth["curve_table_bbox_pt"]
     corners = [to_px([x, y]) for x in (x0, x1) for y in (y0, y1)]

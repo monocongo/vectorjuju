@@ -140,6 +140,11 @@ def test_arc_classification_is_dpi_invariant(dpi: float):
     kind, fit = classify(runs[0].points_px, dpi)
     assert kind == "curve"
     assert fit is not None
+    # Kind is what has to be invariant. At 400 dpi the same fit can be 3.6 %
+    # off the planted radius -- a 40 degree arc's radius is ill-conditioned
+    # against sub-pixel thinning -- while its residual stays 30x under the
+    # gate. Radius accuracy is gated at the reference dpi in
+    # test_drawn_arc_classifies_as_a_circle.
 
 
 def test_bow_gate_scales_with_dpi():
