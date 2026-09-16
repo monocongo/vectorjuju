@@ -503,17 +503,21 @@ def bind_calls(
     # call's read (or reporting one call twice). Collapse reads of the same
     # parsed call whose boxes overlap; the first read wins (page items precede
     # crop items), and a collapsed duplicate is not a second call, so it stays
-    # out of ``unbound_text`` too.
+    # out of ``unbound_text`` too. Every earlier read stays a peer, merged ones
+    # included, so a chain of mutually overlapping reads (page -> crop -> crop)
+    # collapses whole: a read overlapping only a merged duplicate is still the
+    # same physical label, and the first read remains the representative.
     distinct: list[tuple[int, ParsedCall]] = []
     boxes_by_call: dict[tuple[object, ...], list[int]] = {}
     merged_item_indices: set[int] = set()
     for item_index, call in callable_items:
         key = (call.kind, call.bearing_deg, call.distance_ft, call.curve_id)
         peers = boxes_by_call.setdefault(key, [])
-        if any(_boxes_overlap(items[item_index].box_px, items[peer].box_px) for peer in peers):
+        duplicate = any(_boxes_overlap(items[item_index].box_px, items[peer].box_px) for peer in peers)
+        peers.append(item_index)
+        if duplicate:
             merged_item_indices.add(item_index)
             continue
-        peers.append(item_index)
         distinct.append((item_index, call))
     callable_items = distinct
 

@@ -511,6 +511,28 @@ def test_bind_calls_collapses_duplicate_reads_of_one_call() -> None:
     assert by_call[other.text] is run2
 
 
+def test_bind_calls_collapses_a_chain_of_overlapping_duplicate_reads() -> None:
+    """Regression: three reads of one label where only consecutive boxes
+    overlap (page -> crop -> crop). The third read overlaps the merged crop but
+    not the page representative; checking overlap against representatives alone
+    left it distinct, letting it claim run2 and strand run2's real call."""
+    call = "N 90°00'00\" E  100.00'"
+    run1 = _run([(0.0, 0.0), (100.0, 0.0)])
+    run2 = _run([(100.0, 0.0), (100.0, 100.0)])
+    page = TextItem(text=call, box_px=(68.0, 0.0, 72.0, 4.0), source="page")
+    crop1 = TextItem(text=call, box_px=(70.0, 0.0, 74.0, 4.0), source="crop")
+    crop2 = TextItem(text=call, box_px=(72.5, 0.0, 76.5, 4.0), source="crop")
+    other = TextItem(text="S 45°00'00\" W  50.00'", box_px=(133.0, 48.0, 137.0, 52.0), source="page")
+
+    bound, unbound = bind_calls([run1, run2], [page, crop1, crop2, other], dpi=200.0)
+
+    assert unbound == []
+    assert len(bound) == 2
+    by_call = {bc.call.raw_text: bc.run for bc in bound}
+    assert by_call[call] is run1  # page geometry kept; both crop duplicates dropped
+    assert by_call[other.text] is run2
+
+
 def test_bind_calls_is_deterministic() -> None:
     boundary = _run([(0.0, 0.0), (200.0, 0.0)])
     other = _run([(0.0, 300.0), (200.0, 300.0)])
