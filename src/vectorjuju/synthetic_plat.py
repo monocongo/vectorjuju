@@ -307,7 +307,18 @@ def generate_sheet(out_dir: Path) -> dict:
         "curves": curves,
         "curve_table_cells": rows,
         "curve_table_bbox_pt": table_bbox,
-        "distractor_text": ["IPF", "IPS", "N", "0        50       100 FEET", "CURVE TABLE"],
+        "distractor_text": [
+            "IPF",
+            "IPS",
+            "N",
+            "0        50       100 FEET",
+            "CURVE TABLE",
+            "SYNTHETIC PLAT OF SURVEY",
+            "PROJECT-AUTHORED TEST SHEET",
+            "NOT A REAL PLAT / NOT A SURVEY",
+            "vectorjuju synthetic fixture",
+            "SCALE: 1\" = 100'",
+        ],
     }
     (out_dir / "ground_truth.json").write_text(json.dumps(ground_truth, indent=2), encoding="utf-8")
 

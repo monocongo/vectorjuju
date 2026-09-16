@@ -1,17 +1,20 @@
-"""Ingest and pixel-to-CAD transform tests: gate U1 and the input half of A10."""
+"""Ingest, pixel-to-CAD transform, and text/binding tests: gates U1, U5, and the input half of A10."""
 
 from __future__ import annotations
 
 import math
 from pathlib import Path
 
+import numpy as np
 import pypdfium2 as pdfium
 import pytest
 from PIL import Image, ImageChops, ImageStat
 from reportlab.pdfgen import canvas
 
 from vectorjuju.convert import UnsupportedInputError, VectorjujuError, cad_to_px, load_raster, px_to_cad
-from vectorjuju.synthetic_plat import PAGE_H, PAGE_W, RENDER_DPI, generate_sheet
+from vectorjuju.synthetic_plat import PAGE_H, PAGE_W, PARCEL_FT, RENDER_DPI, bearing_distance, generate_sheet
+from vectorjuju.text import TextItem, bind_calls, normalize_ocr, parse_call
+from vectorjuju.tracing import Run
 
 EXPECTED_SIZE = (round(PAGE_W * RENDER_DPI / 72), round(PAGE_H * RENDER_DPI / 72))  # 1700 x 2200
 POINTS = [(0.0, 0.0), (37.5, 812.25), (1699.0, 2199.0), (850.0, 1100.0)]
@@ -152,3 +155,152 @@ def test_transform_refuses_scales_that_cannot_be_a_calibration(fpp: float) -> No
         px_to_cad((1.0, 2.0), fpp=fpp, img_height=100)
     with pytest.raises(ValueError):
         cad_to_px((1.0, 2.0), fpp=fpp, img_height=100)
+
+
+# --- U5: parsing and binding, no OCR ----------------------------------------
+
+STRAIGHT_EDGES = [i for i in range(len(PARCEL_FT)) if i not in (2, 4)]  # CURVE_EDGES are 2 and 4
+
+
+def _run(points: list[tuple[float, float]]) -> Run:
+    return Run(points_px=np.array(points, dtype=float))
+
+
+@pytest.mark.parametrize("edge", STRAIGHT_EDGES)
+def test_parse_call_recovers_each_planted_straight_call(edge: int) -> None:
+    n = len(PARCEL_FT)
+    p0, p1 = PARCEL_FT[edge], PARCEL_FT[(edge + 1) % n]
+    bearing, dist_ft = bearing_distance(p0, p1)
+    raw = f"{bearing}  {dist_ft:.2f}'"  # synthetic_plat.py's own label format
+
+    call = parse_call(raw)
+
+    assert call is not None
+    assert call.kind == "bearing_distance"
+    assert math.isclose(call.distance_ft, round(dist_ft, 2), abs_tol=1e-9)
+    dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+    expected_az = math.degrees(math.atan2(dx, dy)) % 360.0
+    # dms() rounds to the nearest arcsecond before formatting; recovering the
+    # bearing from that text can be off by up to half an arcsecond (~1.4e-4 deg).
+    assert math.isclose(call.bearing_deg, expected_az, abs_tol=1e-3)
+    assert call.suspect_tokens == ()
+
+
+@pytest.mark.parametrize("raw", ["C1", "C2", "c1"])
+def test_parse_call_reads_bare_curve_refs(raw: str) -> None:
+    call = parse_call(raw)
+    assert call is not None
+    assert call.kind == "curve_ref"
+    assert call.curve_id == raw.upper()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "PARCEL 5",
+        "LOT 12",
+        "24l",
+        "L=150.00'",
+        "R=150.00'",
+        "RAD. 150",
+        "N 45°30' 100.00'",  # historic space-capture bug: no [EW] present at all
+        "190.00'",  # curve-table radius cell: no bearing
+        "36°41'27\"",  # curve-table delta cell: no quadrant letters
+        "SCALE: 1\" = 100'",
+        "IPF",
+        "IPS",
+        "CURVE TABLE",
+    ],
+)
+def test_parse_call_rejects_non_calls(raw: str) -> None:
+    assert parse_call(raw) is None
+
+
+def test_parse_call_accepts_a_whole_degree_bearing_with_no_minutes() -> None:
+    call = parse_call("N 45° E 100.00'")
+    assert call is not None
+    assert math.isclose(call.bearing_deg, 45.0, abs_tol=1e-6)
+    assert math.isclose(call.distance_ft, 100.0)
+
+
+def test_parse_call_rejects_out_of_range_degrees() -> None:
+    assert parse_call("N 999°99' E 100.00'") is None
+
+
+@pytest.mark.parametrize(
+    ("raw", "suspect"),
+    [
+        ('N 87°42\'34" E  200.16"', "foot-mark"),  # foot mark misread as inch mark
+        ("N 87°42'34\" E  200.16*", "foot-mark"),  # foot mark dropped to a stray asterisk
+        ("N 87 42'34\" E  200.16'", "degree-mark"),  # degree mark dropped
+    ],
+)
+def test_parse_call_flags_a_corrupted_mark_as_suspect(raw: str, suspect: str) -> None:
+    call = parse_call(raw)
+    assert call is not None
+    assert suspect in call.suspect_tokens
+
+
+def test_normalize_ocr_folds_punctuation_confusables_before_case_folding() -> None:
+    assert normalize_ocr("n 45º30′ e") == "N 45°30' E"
+
+
+def test_bind_calls_prefers_the_nearer_of_two_runs() -> None:
+    near = _run([(0.0, 0.0), (200.0, 0.0)])
+    far = _run([(0.0, -40.0), (200.0, -40.0)])
+    item = TextItem(text="N 90°00'00\" E  200.00'", box_px=(90.0, -3.0, 130.0, 3.0), source="page")
+
+    bound, unbound = bind_calls([near, far], [item])
+
+    assert len(bound) == 1
+    assert bound[0].run is near
+    assert unbound == []
+
+
+def test_bind_calls_sends_off_gate_text_to_unbound_never_force_bound() -> None:
+    boundary = _run([(0.0, 0.0), (200.0, 0.0)])
+    far_item = TextItem(text="N 90°00'00\" E  200.00'", box_px=(90.0, 500.0, 130.0, 506.0), source="page")
+
+    bound, unbound = bind_calls([boundary], [far_item])
+
+    assert bound == []
+    assert unbound == [far_item]
+
+
+def test_bind_calls_never_binds_a_non_call() -> None:
+    boundary = _run([(0.0, 0.0), (200.0, 0.0)])
+    table_cell = TextItem(text="190.00'", box_px=(90.0, 2.0, 120.0, 8.0), source="page")
+
+    bound, unbound = bind_calls([boundary], [table_cell])
+
+    assert bound == []
+    assert unbound == [table_cell]
+
+
+def test_bind_calls_binds_each_run_at_most_once() -> None:
+    boundary = _run([(0.0, 0.0), (200.0, 0.0)])
+    first = TextItem(text="N 90°00'00\" E  200.00'", box_px=(90.0, 1.0, 130.0, 3.0), source="crop")
+    second = TextItem(text="N 90°00'00\" E  200.00'", box_px=(95.0, 4.0, 135.0, 8.0), source="page")
+
+    bound, unbound = bind_calls([boundary], [first, second])
+
+    assert len(bound) == 1
+    assert bound[0].item is first  # closer of the two (distance 2 px vs 6 px)
+    assert unbound == [second]
+
+
+def test_bind_calls_is_deterministic() -> None:
+    boundary = _run([(0.0, 0.0), (200.0, 0.0)])
+    other = _run([(0.0, 300.0), (200.0, 300.0)])
+    items = [
+        TextItem(text="N 90°00'00\" E  200.00'", box_px=(90.0, 1.0, 130.0, 3.0), source="crop"),
+        TextItem(text="C1", box_px=(90.0, 298.0, 110.0, 302.0), source="crop"),
+    ]
+
+    first_bound, first_unbound = bind_calls([boundary, other], items)
+    second_bound, second_unbound = bind_calls([boundary, other], items)
+
+    assert [(b.run is boundary, b.call.raw_text) for b in first_bound] == [
+        (b.run is boundary, b.call.raw_text) for b in second_bound
+    ]
+    assert first_unbound == second_unbound
