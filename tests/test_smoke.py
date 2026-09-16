@@ -19,3 +19,9 @@ def test_calibration_api_is_exported():
     assert calibrate_scale is calibrate.calibrate_scale
     assert Scale is calibrate.Scale
     assert ScaleCalibrationError is calibrate.ScaleCalibrationError
+
+
+def test_writer_api_is_exported():
+    from vectorjuju import export, write_outputs
+
+    assert write_outputs is export.write_outputs
