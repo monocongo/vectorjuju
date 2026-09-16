@@ -490,6 +490,27 @@ def test_bind_calls_penalty_exceeds_a_whole_valid_matching_not_just_one_distance
     assert [b.run for b in bound] == runs
 
 
+def test_bind_calls_collapses_duplicate_reads_of_one_call() -> None:
+    """Regression: the page pass and the band crop both read one label, and
+    binding both let the duplicate claim run2 while run2's real call (whose
+    read is only in gate of run2) was stranded in unbound. A collapsed
+    duplicate must also not resurface in unbound_text as a second call."""
+    call = "N 90°00'00\" E  100.00'"
+    run1 = _run([(0.0, 0.0), (100.0, 0.0)])
+    run2 = _run([(100.0, 0.0), (100.0, 100.0)])
+    page = TextItem(text=call, box_px=(68.0, 0.0, 72.0, 4.0), source="page")
+    crop = TextItem(text=call, box_px=(68.0, 0.0, 72.0, 4.0), source="crop")
+    other = TextItem(text="S 45°00'00\" W  50.00'", box_px=(133.0, 48.0, 137.0, 52.0), source="page")
+
+    bound, unbound = bind_calls([run1, run2], [page, crop, other], dpi=200.0)
+
+    assert unbound == []
+    assert len(bound) == 2
+    by_call = {bc.call.raw_text: bc.run for bc in bound}
+    assert by_call[call] is run1  # page geometry kept; crop duplicate dropped
+    assert by_call[other.text] is run2
+
+
 def test_bind_calls_is_deterministic() -> None:
     boundary = _run([(0.0, 0.0), (200.0, 0.0)])
     other = _run([(0.0, 300.0), (200.0, 300.0)])

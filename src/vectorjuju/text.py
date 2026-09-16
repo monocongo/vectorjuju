@@ -472,6 +472,11 @@ def _point_run_distance(point: tuple[float, float], run: Run) -> float:
     return best
 
 
+def _boxes_overlap(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> bool:
+    """True when two OCR boxes share area -- the same physical text read twice."""
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
 def bind_calls(
     runs: Sequence[Run], items: Sequence[TextItem], *, dpi: float = 200.0
 ) -> tuple[list[BoundCall], list[TextItem]]:
@@ -479,7 +484,10 @@ def bind_calls(
     bind distance over the whole sheet at once -- not nearest-first greedy,
     which lets one call steal a run a farther call needed more (docs/
     prior-art/20-implementation-plan.md's "assignment, not greedy" binding
-    requirement). One call per run, one run per call.
+    requirement). One call per run, one run per call. Duplicate reads of one
+    call -- the page pass and a band crop both reading the same label -- are
+    collapsed first (same parsed call, overlapping boxes), so a call cannot
+    claim two runs.
 
     Everything that fails to parse as a call, or has no run within the gate,
     comes back in the second list -- never force-bound.
@@ -488,6 +496,26 @@ def bind_calls(
     callable_items = [(index, call) for index, item in enumerate(items) if (call := parse_call(item.text))]
     if not callable_items or not runs:
         return [], list(items)
+
+    # One physical label is routinely read twice -- the full-page pass and the
+    # deskewed band crop that exists to recover rotated text -- and binding
+    # both reads lets one call claim two runs, stranding a different, real
+    # call's read (or reporting one call twice). Collapse reads of the same
+    # parsed call whose boxes overlap; the first read wins (page items precede
+    # crop items), and a collapsed duplicate is not a second call, so it stays
+    # out of ``unbound_text`` too.
+    distinct: list[tuple[int, ParsedCall]] = []
+    boxes_by_call: dict[tuple[object, ...], list[int]] = {}
+    merged_item_indices: set[int] = set()
+    for item_index, call in callable_items:
+        key = (call.kind, call.bearing_deg, call.distance_ft, call.curve_id)
+        peers = boxes_by_call.setdefault(key, [])
+        if any(_boxes_overlap(items[item_index].box_px, items[peer].box_px) for peer in peers):
+            merged_item_indices.add(item_index)
+            continue
+        peers.append(item_index)
+        distinct.append((item_index, call))
+    callable_items = distinct
 
     distances = np.array(
         [
@@ -521,5 +549,7 @@ def bind_calls(
     # row_index is sorted ascending (scipy guarantees this), and rows follow
     # callable_items' -- hence items' -- own order, so this needs no extra
     # sort to stay deterministic (A8).
-    unbound = [item for index, item in enumerate(items) if index not in bound_item_indices]
+    unbound = [
+        item for index, item in enumerate(items) if index not in bound_item_indices and index not in merged_item_indices
+    ]
     return bound, unbound
