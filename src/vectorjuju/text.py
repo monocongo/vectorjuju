@@ -278,14 +278,15 @@ def _convert_path(path: Path):
 
 
 # OCR input scale. The fixture's 7.5 pt labels are ~21 px tall at the
-# reference 200 dpi, and both engines misread their distance digits there
+# reference 200 dpi, and both engines misread them at native resolution
 # (RapidOCR dropped a decimal point or a digit on Linux; ocrmac's reads are
-# stable but lossy). Handing the engines a LANCZOS pre-scale instead of
-# docling's own default 3.0x resample fixes the reads on both, and pixel-wise
-# it is cheaper than the default it replaces. Capped so a large sheet cannot
-# blow up the OCR buffer; a page already over the cap is passed through.
-_OCR_UPSCALE = 2.0
-_OCR_MAX_PIXELS = 24_000_000
+# stable but lossy), and at 2x RapidOCR still misses the short curve-ref
+# labels. Handing the engines a LANCZOS 3x pre-scale instead of docling's own
+# default 3.0x resample keeps the reads correct on both, and pixel-wise it is
+# no more than the default it replaces. Capped so a large sheet cannot blow
+# up the OCR buffer; a page already over the cap is scaled less.
+_OCR_UPSCALE = 3.0
+_OCR_MAX_PIXELS = 40_000_000
 
 
 def _ocr_image(image: Image.Image) -> tuple[Image.Image, float]:

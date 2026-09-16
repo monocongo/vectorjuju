@@ -79,7 +79,11 @@ def _segment_of(sheet: SyntheticSheet, label: dict) -> dict:
 def _matched_entity(conversion: Conversion, text: str) -> dict:
     """The single sidecar entity whose label reads ``text`` with fidelity."""
     matches = [entry for entry in conversion.labeled if label_passes(entry["label"]["raw_text"], text)]
-    assert len(matches) == 1, f"{text!r}: {len(matches)} sidecar entities match"
+    assert len(matches) == 1, (
+        f"{text!r}: {len(matches)} sidecar entities match; "
+        f"bound={[entry['label']['raw_text'] for entry in conversion.labeled]!r} "
+        f"unbound={[item['raw_text'] for item in conversion.sidecar['unbound_text']]!r}"
+    )
     return matches[0]
 
 
