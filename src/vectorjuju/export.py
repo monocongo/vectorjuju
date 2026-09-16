@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal
@@ -22,7 +23,7 @@ from typing import Literal
 import ezdxf
 
 from vectorjuju.calibrate import Scale
-from vectorjuju.convert import px_to_cad
+from vectorjuju.convert import _require_fpp, _require_img_height, px_to_cad
 from vectorjuju.curves import CircleFit, classify
 from vectorjuju.text import BoundCall, ParsedCall, TextItem
 from vectorjuju.tracing import Run
@@ -37,6 +38,10 @@ INSUNITS: dict[str, int] = {"us-survey-foot": 21, "international-foot": 2, "metr
 # take the DXF's unitless default, wrong at survey scale, so the height is that
 # many page points at the working dpi, in drawing units.
 _FONT_SIZE_PT = 7.5
+
+# ezdxf's fixed-metadata switch is process-global, so overlapping writes must
+# not share the interval; whoever holds this holds the switch.
+_META_LOCK = threading.Lock()
 
 
 def write_outputs(
@@ -54,9 +59,15 @@ def write_outputs(
 
     ``scale`` is the calibrated units-per-pixel and how it was obtained, and
     ``img_height`` the ingested raster's height, the pixel-to-CAD flip's
-    origin. ``bound`` are the calls bound to runs (one label each) and
-    ``unbound`` everything that never bound, which the sidecar keeps as
-    ``unbound_text``.
+    origin. Both are enforced here, whatever the input: an empty sheet must
+    not publish metadata that no conversion ever checked. ``out`` names the
+    DXF and a ``.json`` path is rejected -- that is the sidecar's own.
+    ``bound`` are the calls bound to runs (one label each) and ``unbound``
+    everything that never bound, which the sidecar keeps as ``unbound_text``.
+
+    Both artifacts are staged whole and then published sidecar first, so a
+    failure writing either one leaves the previous pair in place; only the two
+    renames can interleave, and POSIX has no two-file transaction above that.
 
     Both files are byte-identical across runs over the same input: ezdxf
     otherwise stamps a version+timestamp marker at document creation, a
@@ -65,12 +76,23 @@ def write_outputs(
     them. It is restored afterwards; see the module test for the leak check.
     """
     out = Path(out)
+    sidecar_path = out.with_suffix(".json")
+    if out.suffix.lower() == ".json":
+        raise ValueError(f"out must name the DXF, got the sidecar's own path {out}")
     insunits = _insunits(units)
+    fpp = _require_fpp(scale.value, "write_outputs")
+    height = _require_img_height(img_height, "write_outputs")
+    if not math.isfinite(dpi) or dpi <= 0:
+        raise ValueError(f"write_outputs requires a finite dpi > 0, got {dpi!r}")
     labels = {call.run: call for call in bound}
+    # Both staged beside their targets, so neither publish leaves a half file.
+    staged_dxf = out.with_suffix(out.suffix + ".tmp")
+    staged_sidecar = sidecar_path.with_suffix(".json.tmp")
 
     def to_cad(point) -> tuple[float, float]:
-        return px_to_cad(tuple(point), fpp=scale.value, img_height=img_height)
+        return px_to_cad(tuple(point), fpp=fpp, img_height=height)
 
+    _META_LOCK.acquire()
     previous = ezdxf.options.write_fixed_meta_data_for_testing
     ezdxf.options.write_fixed_meta_data_for_testing = True
     try:
@@ -79,23 +101,19 @@ def write_outputs(
         for layer in LAYERS:
             doc.layers.add(layer)
         msp = doc.modelspace()
-        char_height = _FONT_SIZE_PT / 72.0 * dpi * scale.value
+        char_height = _FONT_SIZE_PT / 72.0 * dpi * fpp
 
+        # One CAD list per run, shared by the entity and the sidecar entry: the
+        # geometry is unbounded, so nothing keeps a second copy of it alive.
         entities: list[dict] = []
-        held: list[tuple[ParsedCall, TextItem, list[tuple[float, float]]]] = []
+        held: list[tuple[ParsedCall, TextItem, list[list[float]]]] = []
         for run in runs:
-            cad = [to_cad(point) for point in run.points_px]
+            cad = [list(to_cad(point)) for point in run.points_px]
             closed = len(cad) > 2 and cad[0] == cad[-1]
             kind, fit = classify(run.points_px, dpi)
-            _draw_boundary(msp, cad, closed, kind, fit, to_cad, scale.value)
+            _draw_boundary(msp, cad, closed, kind, fit, to_cad, fpp)
             call = labels.get(run)
-            entities.append(
-                {
-                    "type": kind,
-                    "points": [[x, y] for x, y in cad],
-                    "label": _sidecar_label(call, fit, scale.value),
-                }
-            )
+            entities.append({"type": kind, "points": cad, "label": _sidecar_label(call, fit, fpp)})
             if call is not None:
                 held.append((call.call, call.item, cad))
 
@@ -108,16 +126,23 @@ def write_outputs(
         ]
         sidecar = {
             "units": units,
-            "scale": {"value": scale.value, "method": scale.method},
+            "scale": {"value": fpp, "method": scale.method},
             "dpi": dpi,
             "entities": entities,
             "unbound_text": unbound_text,
         }
 
-        doc.saveas(out)
-        out.with_suffix(".json").write_text(json.dumps(sidecar, indent=2) + "\n", encoding="utf-8")
+        doc.saveas(staged_dxf)
+        with staged_sidecar.open("w", encoding="utf-8") as handle:
+            json.dump(sidecar, handle, indent=2)
+            handle.write("\n")
+        staged_sidecar.replace(sidecar_path)
+        staged_dxf.replace(out)
     finally:
+        staged_dxf.unlink(missing_ok=True)
+        staged_sidecar.unlink(missing_ok=True)
         ezdxf.options.write_fixed_meta_data_for_testing = previous
+        _META_LOCK.release()
     return out
 
 
@@ -134,7 +159,7 @@ def _box_center(box: tuple[float, float, float, float]) -> tuple[float, float]:
 
 
 def _draw_boundary(
-    msp, cad: list[tuple[float, float]], closed: bool, kind: str, fit: CircleFit | None, to_cad, fpp: float
+    msp, cad: list[list[float]], closed: bool, kind: str, fit: CircleFit | None, to_cad, fpp: float
 ) -> None:
     points = cad[:-1] if closed else cad
     if kind == "line":
@@ -159,7 +184,7 @@ def _draw_boundary(
             spline.closed = True
 
 
-def _draw_label(msp, item: TextItem, cad: list[tuple[float, float]], char_height: float, to_cad) -> None:
+def _draw_label(msp, item: TextItem, cad: list[list[float]], char_height: float, to_cad) -> None:
     """One MTEXT at the label's own OCR position, middle-centered so the
     insertion point is the text box's centre however the text is rotated."""
     mtext = msp.add_mtext(
@@ -174,7 +199,7 @@ def _draw_label(msp, item: TextItem, cad: list[tuple[float, float]], char_height
     mtext.set_location(to_cad(_box_center(item.box_px)))
 
 
-def _run_rotation(cad: list[tuple[float, float]]) -> float:
+def _run_rotation(cad: list[list[float]]) -> float:
     """The run's own direction, folded to (-90, 90] like the fixture's labels:
     a run traced either way round gets the same rotation."""
     first, last = cad[0], cad[-1]

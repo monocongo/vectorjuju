@@ -7,6 +7,7 @@ fixture drift; the acceptance suite re-runs these gates over traced media.
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import ezdxf
@@ -259,3 +260,87 @@ def test_empty_sheet_writes_both_files(tmp_path):
 def test_scale_method_survives_into_the_sidecar(tmp_path):
     _, sidecar = _write(tmp_path, [_line_run()], [], [], scale=Scale(value=FPP, method="ransac"))
     assert sidecar["scale"] == {"value": FPP, "method": "ransac"}
+
+
+def test_rejects_a_json_out_path(tmp_path):
+    """A .json out is the sidecar's own path: the sidecar would replace the DXF
+    and the return would name metadata as if it were the drawing."""
+    with pytest.raises(ValueError, match="out must name the DXF"):
+        write_outputs(tmp_path / "sheet.json", [], [], [], scale=SCALE, img_height=IMG_HEIGHT)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("scale", "img_height", "dpi", "match"),
+    [
+        (Scale(value=float("nan"), method="override"), IMG_HEIGHT, DPI, "finite fpp"),
+        (Scale(value=0.0, method="override"), IMG_HEIGHT, DPI, "finite fpp"),
+        (SCALE, 0, DPI, "finite img_height"),
+        (SCALE, IMG_HEIGHT, 0, "finite dpi"),
+        (SCALE, IMG_HEIGHT, float("inf"), "finite dpi"),
+    ],
+)
+def test_empty_sheet_rejects_invalid_calibration_and_raster_metadata(tmp_path, scale, img_height, dpi, match):
+    """No conversion ever runs over an empty sheet, so the writer has to check
+    the values itself rather than inherit the check from a transformed point."""
+    with pytest.raises(ValueError, match=match):
+        write_outputs(tmp_path / "sheet.dxf", [], [], [], scale=scale, img_height=img_height, dpi=dpi)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_failed_sidecar_publication_leaves_the_previous_pair_intact(tmp_path):
+    """Major: a sidecar that cannot be published must not leave a new DXF beside
+    the old metadata -- or any staged file behind."""
+    runs, bound, unbound = _planted()
+    out = write_outputs(tmp_path / "sheet.dxf", runs, bound, unbound, scale=SCALE, img_height=IMG_HEIGHT)
+    dxf_before = out.read_bytes()
+
+    sidecar_path = tmp_path / "sheet.json"
+    sidecar_path.unlink()
+    sidecar_path.mkdir()  # a directory the sidecar cannot replace
+
+    with pytest.raises(OSError):
+        write_outputs(tmp_path / "sheet.dxf", runs, bound, unbound, scale=SCALE, img_height=IMG_HEIGHT)
+
+    assert out.read_bytes() == dxf_before  # the drawing is not republished on its own
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == ["sheet.dxf", "sheet.json"]
+
+
+def test_overlapping_writers_do_not_share_the_metadata_window(tmp_path, monkeypatch):
+    """Minor: the fixed-metadata switch is process-global. Two overlapping writers
+    must serialize, or the second one's restore leaves it set (and the first
+    one's document can be saved without the fixed metadata)."""
+    runs, bound, unbound = _planted()
+    ezdxf.options.write_fixed_meta_data_for_testing = False
+    first_inside, second_inside = threading.Event(), threading.Event()
+    release_first, release_second = threading.Event(), threading.Event()
+    calls: list[int] = []
+    real_new = ezdxf.new
+
+    def gated_new(*args, **kwargs):
+        calls.append(1)
+        inside, release = (first_inside, release_first) if len(calls) == 1 else (second_inside, release_second)
+        inside.set()
+        release.wait(5)
+        return real_new(*args, **kwargs)
+
+    monkeypatch.setattr(ezdxf, "new", gated_new)
+    threads = [
+        threading.Thread(
+            target=write_outputs,
+            args=(tmp_path / name, runs, bound, unbound),
+            kwargs={"scale": SCALE, "img_height": IMG_HEIGHT},
+        )
+        for name in ("first.dxf", "second.dxf")
+    ]
+    threads[0].start()
+    assert first_inside.wait(5)
+    threads[1].start()
+    second_inside.wait(0.5)  # only a writer that skipped the lock gets in here
+    release_first.set()
+    threads[0].join(5)
+    release_second.set()
+    threads[1].join(5)
+
+    assert ezdxf.options.write_fixed_meta_data_for_testing is False
+    assert (tmp_path / "first.dxf").exists() and (tmp_path / "second.dxf").exists()
