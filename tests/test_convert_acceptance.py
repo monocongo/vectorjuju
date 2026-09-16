@@ -192,7 +192,10 @@ def test_a4_true_arcs_with_endpoints_radius_and_bulge(conversion: Conversion, sy
             * RENDER_DPI
             / 72.0
         )
-        assert abs(arc.dxf.radius / float(conversion.sidecar["scale"]["value"]) - planted_radius_px) / planted_radius_px <= 0.03, label["id"]
+        assert (
+            abs(arc.dxf.radius / float(conversion.sidecar["scale"]["value"]) - planted_radius_px) / planted_radius_px
+            <= 0.03
+        ), label["id"]
 
         ends = to_px_points(
             [tuple(arc.start_point)[:2], tuple(arc.end_point)[:2]],
