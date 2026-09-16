@@ -21,6 +21,11 @@ RASTER_SUFFIXES = frozenset({".jpg", ".jpeg", ".tif", ".tiff"})
 _RASTER_FORMATS = frozenset({"JPEG", "MPO", "TIFF"})
 _PDF_SUFFIX = ".pdf"
 
+# Pillow's MAX_IMAGE_PIXELS bounds decompression bombs, not process memory.
+# Ingest peaks near 12 bytes/pixel (decoded, transposed, and RGB buffers), so
+# cap accepted rasters at 256 MiB of peak allocations (~22M pixels).
+MAX_INGEST_PIXELS = 256 * 1024 * 1024 // 12
+
 
 class VectorjujuError(Exception):
     """Base class for vectorjuju errors."""
@@ -36,6 +41,12 @@ def _require_fpp(fpp: float | None, caller: str) -> float:
     if not math.isfinite(fpp) or fpp <= 0:
         raise ValueError(f"{caller} requires a finite fpp > 0, got {fpp!r}")
     return fpp
+
+
+def _require_img_height(img_height: float, caller: str) -> float:
+    if not math.isfinite(img_height) or img_height <= 0:
+        raise ValueError(f"{caller} requires a finite img_height > 0, got {img_height!r}")
+    return img_height
 
 
 def load_raster(path: str | Path, dpi: int = 200) -> Image.Image:
@@ -68,7 +79,7 @@ def _load_pdf(path: Path, dpi: int) -> Image.Image:
         page = pdf[0]
         width_pt, height_pt = page.get_size()
         pixels = width_pt * height_pt * (dpi / 72) ** 2
-        if pixels > Image.MAX_IMAGE_PIXELS:
+        if pixels > MAX_INGEST_PIXELS:
             raise UnsupportedInputError(f"page too large to render at {dpi} dpi: {path.name}")
         return page.render(scale=dpi / 72).to_pil().convert("RGB")
     except UnsupportedInputError:
@@ -89,7 +100,7 @@ def _load_image(path: Path) -> Image.Image:
             frames = getattr(image, "n_frames", 1)
             if frames != 1:
                 raise UnsupportedInputError(f"image must have exactly one frame, found {frames}: {path.name}")
-            if image.size[0] * image.size[1] > Image.MAX_IMAGE_PIXELS:
+            if image.size[0] * image.size[1] > MAX_INGEST_PIXELS:
                 raise UnsupportedInputError(f"image too large to decode: {path.name}")
             return ImageOps.exif_transpose(image).convert("RGB")
     except UnsupportedInputError:
@@ -103,6 +114,7 @@ def _load_image(path: Path) -> Image.Image:
 def px_to_cad(pt: tuple[float, float], *, fpp: float | None = None, img_height: int) -> tuple[float, float]:
     """Raster px (top-left, y down) -> CAD units (bottom-left, y up)."""
     fpp = _require_fpp(fpp, "px_to_cad")
+    img_height = _require_img_height(img_height, "px_to_cad")
     x, y = pt
     return x * fpp, (img_height - y) * fpp
 
@@ -110,5 +122,6 @@ def px_to_cad(pt: tuple[float, float], *, fpp: float | None = None, img_height: 
 def cad_to_px(pt: tuple[float, float], *, fpp: float | None = None, img_height: int) -> tuple[float, float]:
     """CAD units (bottom-left, y up) -> raster px (top-left, y down)."""
     fpp = _require_fpp(fpp, "cad_to_px")
+    img_height = _require_img_height(img_height, "cad_to_px")
     x, y = pt
     return x / fpp, img_height - y / fpp

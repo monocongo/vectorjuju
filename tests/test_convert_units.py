@@ -107,6 +107,15 @@ def test_unsupported_inputs_raise_and_write_nothing(bad_inputs: Path, media: str
     assert set(bad_inputs.iterdir()) == before
 
 
+@pytest.mark.parametrize("media", ["sheet.pdf", "sheet.jpg", "sheet.tif"])
+def test_near_limit_rasters_are_rejected_by_the_ingest_budget(
+    sheet: Path, media: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("vectorjuju.convert.MAX_INGEST_PIXELS", 8)
+    with pytest.raises(UnsupportedInputError):
+        load_raster(sheet / media)
+
+
 @pytest.mark.parametrize("fpp", [72 / (0.85 * 200), 0.129092])
 def test_px_to_cad_round_trips(fpp: float) -> None:
     for img_height in (2200, 1100):
@@ -127,6 +136,14 @@ def test_transform_refuses_pixel_units_without_calibration() -> None:
         px_to_cad((1.0, 2.0), img_height=100)
     with pytest.raises(ValueError):
         cad_to_px((1.0, 2.0), img_height=100)
+
+
+@pytest.mark.parametrize("img_height", [0, -1, float("nan"), float("inf")])
+def test_transform_refuses_raster_heights_that_cannot_place_the_origin(img_height: float) -> None:
+    with pytest.raises(ValueError):
+        px_to_cad((1.0, 2.0), fpp=0.423529, img_height=img_height)
+    with pytest.raises(ValueError):
+        cad_to_px((1.0, 2.0), fpp=0.423529, img_height=img_height)
 
 
 @pytest.mark.parametrize("fpp", [0.0, -0.42, float("nan"), float("inf")])
