@@ -40,6 +40,9 @@ _JOIN_DEG = 75.0
 _DUPLICATE_PX = 2.0
 _WIDTH_STEP_PX = 0.1
 _MAX_INDEX_CELLS = 4096
+# Per endpoint, not per cell: a crowded cell (hatching, a glyph cluster) would
+# otherwise enumerate every pair inside it and in the eight cells around it.
+_MAX_NEIGHBOURS = 8
 
 _OFFSETS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 
@@ -311,17 +314,20 @@ def _merge_dashes(
 ) -> list[tuple[np.ndarray, float]]:
     """Join collinear paths separated by a small gap into one run.
 
-    Candidate pairs come from an endpoint grid, and the tightest collinear gap
-    is merged first, so a dash chain cannot absorb a merely nearby stroke.
-    Pending candidates sit in a heap and only pairs touching a merged path are
-    rebuilt, so a chain of n fragments is not rescanned n times. Fragments
-    whose endpoints pile into one grid cell still cost their pairwise
-    candidate count: that is the hatch/glyph case, not the dash case.
+    Candidate pairs come from an endpoint grid and are capped to the nearest
+    endpoints around each one, so neither a crowded cell nor a long chain of
+    fragments makes the candidate count explode. The tightest collinear gap is
+    merged first, so a dash chain cannot absorb a merely nearby stroke; the cap
+    keeps the tightest gaps, which are the ones greedy merging wants. Pending
+    candidates sit in a heap and only pairs touching a merged path are rebuilt,
+    so a chain of n fragments is not rescanned n times.
     """
     paths = [np.asarray(path, dtype=float) for path, _ in entries]
     widths = [width for _, width in entries]
     grid = _scaled(_DASH_GAP_PX, dpi) + (max(widths) if widths else 0.0)
     alive = [True] * len(paths)
+    # Endpoint coordinates, one row per fragment, mirrored into the append below.
+    ends = np.array([(path[0, 0], path[0, 1], path[-1, 0], path[-1, 1]) for path in paths]).reshape(-1, 4)
 
     def cell(point: np.ndarray) -> tuple[int, int]:
         return (int(point[0] // grid), int(point[1] // grid))
@@ -342,13 +348,30 @@ def _merge_dashes(
                     del buckets[key]
 
     def neighbours(index: int) -> set[int]:
+        """Candidate fragment indices around ``index``, nearest endpoints first.
+
+        Capped per endpoint: a crowded cell would otherwise enumerate every
+        pair inside it and the eight cells around it. The cap is chosen without
+        sorting the cell, because a crowded cell is exactly the one that would
+        otherwise sort hundreds of candidates once per endpoint.
+        """
         found: set[int] = set()
         for point in (paths[index][0], paths[index][-1]):
             col, row = cell(point)
+            candidates: set[int] = set()
             for dc in (-1, 0, 1):
                 for dr in (-1, 0, 1):
-                    found.update(buckets.get((col + dc, row + dr), ()))
-        found.discard(index)
+                    candidates.update(buckets.get((col + dc, row + dr), ()))
+            candidates.discard(index)
+            if len(candidates) > _MAX_NEIGHBOURS:
+                ids = np.fromiter(candidates, dtype=int, count=len(candidates))
+                near = ends[ids]
+                distance = np.minimum(
+                    np.hypot(near[:, 0] - point[0], near[:, 1] - point[1]),
+                    np.hypot(near[:, 2] - point[0], near[:, 3] - point[1]),
+                )
+                candidates = set(ids[np.argpartition(distance, _MAX_NEIGHBOURS)[:_MAX_NEIGHBOURS]].tolist())
+            found.update(candidates)
         return found
 
     def merge_result(i: int, j: int) -> tuple[float, np.ndarray, np.ndarray] | None:
@@ -357,10 +380,11 @@ def _merge_dashes(
     heap: list[tuple[float, int, int]] = []
     for index in range(len(paths)):
         index_bucket(index)
-    for i, j in _nearby_pairs(paths, grid):
-        result = merge_result(i, j)
-        if result is not None:
-            heappush(heap, (result[0], i, j))
+    for index in range(len(paths)):
+        for other in neighbours(index):
+            result = merge_result(index, other)
+            if result is not None:
+                heappush(heap, (result[0], index, other))
     while heap:
         _, i, j = heappop(heap)
         if not (alive[i] and alive[j]):
@@ -374,6 +398,8 @@ def _merge_dashes(
         drop_bucket(j)
         paths.append(np.vstack([first, second]))
         widths.append(_stroke_width(paths[-1], coverage, dpi))
+        merged = paths[-1]
+        ends = np.vstack([ends, (merged[0, 0], merged[0, 1], merged[-1, 0], merged[-1, 1])])
         alive.append(True)
         index_bucket(len(paths) - 1)
         for other in neighbours(len(paths) - 1):
@@ -384,26 +410,11 @@ def _merge_dashes(
     return [(paths[i], widths[i]) for i in range(len(paths)) if alive[i]]
 
 
-def _nearby_pairs(paths: list[np.ndarray], limit: float) -> set[tuple[int, int]]:
-    """Path index pairs with any endpoints in the same or an adjacent cell."""
-    buckets: dict[tuple[int, int], list[int]] = {}
-    for index, path in enumerate(paths):
-        for point in (path[0], path[-1]):
-            buckets.setdefault((int(point[0] // limit), int(point[1] // limit)), []).append(index)
-    pairs: set[tuple[int, int]] = set()
-    for (col, row), indices in buckets.items():
-        for dc in (-1, 0, 1):
-            for dr in (-1, 0, 1):
-                for i in indices:
-                    for j in buckets.get((col + dc, row + dr), []):
-                        if i != j:
-                            pairs.add((i, j) if i < j else (j, i))
-    return pairs
+def _gap(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.hypot(*(a - b)))
 
 
-def _merge_pair(
-    a: np.ndarray, b: np.ndarray, dpi: float, cap: float
-) -> tuple[float, np.ndarray, np.ndarray] | None:
+def _merge_pair(a: np.ndarray, b: np.ndarray, dpi: float, cap: float) -> tuple[float, np.ndarray, np.ndarray] | None:
     """Orient a and b so a's end meets b's start, or None if they are not a dash gap.
 
     ``cap`` is the stroke width the skeleton throws away at the two facing
@@ -420,7 +431,7 @@ def _merge_pair(
         for reverse_b in (False, True):
             tail = a[0] if reverse_a else a[-1]
             head = b[-1] if reverse_b else b[0]
-            gap = float(np.hypot(*(head - tail)))
+            gap = _gap(head, tail)
             if gap > gap_limit:
                 continue
             outward = _end_direction(a, at_start=reverse_a, window=window)
@@ -480,9 +491,7 @@ def _split_at_corners(path: np.ndarray, dpi: float) -> list[np.ndarray]:
     cursor = 0
     for corner in corners:
         vertex = polygon[corner]
-        index = cursor + int(
-            np.argmin(np.hypot(path[cursor:, 0] - vertex[0], path[cursor:, 1] - vertex[1]))
-        )
+        index = cursor + int(np.argmin(np.hypot(path[cursor:, 0] - vertex[0], path[cursor:, 1] - vertex[1])))
         cursor = index
         markers.append(index)
     markers = sorted(set(markers))
@@ -629,9 +638,17 @@ def _stroke_width(points: np.ndarray, coverage: np.ndarray, dpi: float, *, secti
         if norm == 0:
             continue
         normal = np.array([-tangent[1], tangent[0]]) / norm
-        cols = np.clip(np.rint(points[index, 0] + normal[0] * offsets).astype(int), 0, coverage.shape[1] - 1)
-        rows = np.clip(np.rint(points[index, 1] + normal[1] * offsets).astype(int), 0, coverage.shape[0] - 1)
-        widths.append(float(coverage[rows, cols].sum()) * step)
+        cols = np.rint(points[index, 0] + normal[0] * offsets).astype(int)
+        rows = np.rint(points[index, 1] + normal[1] * offsets).astype(int)
+        # Samples off the raster are dropped, never clipped: clipping maps every
+        # out-of-frame offset onto the edge pixel, so a 1 px line along an edge
+        # counts its one row once per sample and reads wider than the boundary
+        # gate. A partly visible section then measures the ink the raster can
+        # attest to, which is the honest reading of a cropped stroke.
+        inside = (cols >= 0) & (cols < coverage.shape[1]) & (rows >= 0) & (rows < coverage.shape[0])
+        if not inside.any():
+            continue
+        widths.append(float(coverage[rows[inside], cols[inside]].sum()) * step)
     return float(np.percentile(widths, 25)) if widths else 0.0
 
 

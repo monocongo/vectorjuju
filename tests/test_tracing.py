@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from PIL import Image, ImageDraw, ImageFont
 
-from vectorjuju.tracing import trace_runs
+from vectorjuju.tracing import _merge_dashes, trace_runs
 
 DPI = 200.0
 
@@ -100,6 +100,48 @@ def test_dashed_line_merges_into_one_run():
 
     assert len(runs) == 1
     assert np.ptp(runs[0].points_px[:, 0]) >= 170  # spans the gaps
+
+
+@pytest.mark.parametrize("edge", ["top", "bottom", "left", "right"])
+def test_one_pixel_edge_line_is_not_a_boundary(edge: str):
+    """A 1 px line on a raster edge must not measure wide.
+
+    Cross-section samples outside the raster used to clip onto the edge pixel,
+    counting that one row once per sample and lifting the line over the
+    boundary-width gate.
+    """
+    image, draw = _canvas(240, 80)
+    if edge in ("top", "bottom"):
+        y = 0 if edge == "top" else 79
+        draw.line((10, y, 230, y), fill=0, width=1)
+    else:
+        x = 0 if edge == "left" else 239
+        draw.line((x, 10, x, 70), fill=0, width=1)
+
+    assert trace_runs(image, DPI) == []
+
+
+def test_a_crowded_cell_does_not_starve_a_distant_dash_pair():
+    """Forty fragments in one grid cell must not hide a chain 200 px away.
+
+    Endpoint candidates are capped to the nearest few per endpoint so a
+    crowded cell cannot enumerate every pair inside it; the cap must keep the
+    nearest candidates, which are the gaps greedy merging wants first.
+    """
+    coverage = np.zeros((400, 400), np.float32)
+    centre = np.array([196.0, 196.0])
+    crowd = [
+        (np.array([centre, centre + 20.0 * np.array([np.cos(angle), np.sin(angle)])]), 4.0)
+        for angle in np.radians(np.arange(40) * 9.0)
+    ]
+    entries = crowd + [
+        (np.array([[0.0, 0.0], [40.0, 0.0]]), 4.0),
+        (np.array([[46.0, 0.0], [86.0, 0.0]]), 4.0),
+    ]
+
+    merged = _merge_dashes(entries, coverage, DPI)
+
+    assert len(merged) == len(_merge_dashes(crowd, coverage, DPI)) + 1  # the pair merged
 
 
 def test_run_count_is_dpi_invariant():
