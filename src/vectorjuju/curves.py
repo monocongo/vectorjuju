@@ -15,8 +15,8 @@ shows up as a bad circle fit.
 
 The fit is in raster px (top-left origin, y down). ``classify`` carries the
 sweep direction so the DXF writer can emit the bulge on the side the trace
-actually runs; ``px_to_cad`` flips y, so a run that sweeps clockwise on the
-raster page also sweeps clockwise in CAD.
+actually runs; see ``CircleFit.clockwise`` for the endpoint mapping ezdxf's
+counter-clockwise ARC needs.
 """
 
 from __future__ import annotations
@@ -30,10 +30,13 @@ from skimage.measure import CircleModel
 
 from vectorjuju.tracing import _SIMPLIFY_PX, _scaled
 
-# Max fit residual as a fraction of the fitted radius. Clean traced arcs land
-# near 0.001; the prior art's L-corner measured ~13, so 0.03 separates them
-# with two orders of magnitude of headroom, and it matches the suite's 3 %
-# radius tolerance for the arcs the writer emits as ARC.
+# Circles need four points to say anything: any three non-collinear points
+# determine one exactly, so their residual is always zero. Above that, this is
+# the prior art's rule -- clean traced arcs land near 0.001 and the prior
+# art's L-corner measured ~13, so 0.03 separates them by two orders of
+# magnitude. It is the scale of the suite's 3 % radius tolerance, not an
+# implication of it: a short, noisy arc's radius can be less certain than its
+# residual suggests.
 _MAX_RESIDUAL_RATIO = 0.03
 
 Kind = Literal["line", "curve"]
@@ -45,9 +48,14 @@ class CircleFit:
 
     center_px: tuple[float, float]
     radius_px: float
-    max_residual_px: float
     clockwise: bool
-    """Whether the run sweeps clockwise on the page; raster and CAD agree."""
+    """Whether the run sweeps clockwise on the page; raster and CAD agree.
+
+    Raster and CAD show the same page direction (``px_to_cad`` reflects y),
+    but ezdxf ``add_arc`` always sweeps counter-clockwise in CAD coordinates:
+    emit a clockwise run with its endpoint angles swapped -- ``start_angle``
+    from the last run point, ``end_angle`` from the first.
+    """
 
 
 def classify(points_px: ArrayLike, dpi: float) -> tuple[Kind, CircleFit | None]:
@@ -56,7 +64,12 @@ def classify(points_px: ArrayLike, dpi: float) -> tuple[Kind, CircleFit | None]:
     ``("line", None)`` for a straight run, ``("curve", fit)`` for a circular
     arc (emit ARC), and ``("curve", None)`` for a bent run that does not fit a
     circle (emit the SPLINE fallback). ``dpi`` scales the line/curve bow gate
-    the same way ``trace_runs`` scales its simplification tolerance.
+    the same way ``trace_runs`` scales its simplification tolerance, so it has
+    to be the dpi the run was traced at.
+
+    A closed run (first point equals last) fits like any other; the writer has
+    to emit it as a closed entity rather than an ARC between two coincident
+    angles.
     """
     points = np.asarray(points_px, dtype=float)
     if points.ndim != 2 or points.shape[1] != 2 or len(points) < 2:
@@ -70,27 +83,31 @@ def classify(points_px: ArrayLike, dpi: float) -> tuple[Kind, CircleFit | None]:
     # bend below that tolerance is indistinguishable from straight linework.
     if _chord_deviation(points) <= _scaled(_SIMPLIFY_PX, dpi):
         return "line", None
-
-    fit = _fit_circle(points)
-    if (
-        fit is not None
-        and fit.radius_px >= 0.5 * _chord_length(points)  # a circle through the endpoints cannot be tighter
-        and fit.max_residual_px <= _MAX_RESIDUAL_RATIO * fit.radius_px
-    ):
-        return "curve", fit
-    return "curve", None
+    return "curve", _circle_fit(points)
 
 
-def _fit_circle(points: NDArray[np.float64]) -> CircleFit | None:
-    """Least-squares circle, or None when the points cannot estimate one."""
+def _circle_fit(points: NDArray[np.float64]) -> CircleFit | None:
+    """Fit a circle when the run really is one, else None.
+
+    Three points determine a circle exactly, so a three-point run has no
+    residual evidence and goes to the SPLINE fallback instead of a fabricated
+    ARC centre. The radius sanity check keeps a fit that cannot span the run's
+    chord (an arc's chord is never longer than its diameter) out.
+    """
+    if len(points) < 4:
+        return None
     model = CircleModel.from_estimate(points)
-    if not model:  # FailedEstimation: too few non-collinear points
+    if not model:  # FailedEstimation: the points are collinear
         return None
     center = np.asarray(model.center, dtype=float)
+    radius = float(model.radius)
+    if float(np.abs(model.residuals(points)).max()) > _MAX_RESIDUAL_RATIO * radius:
+        return None
+    if radius < 0.5 * _chord_length(points):
+        return None
     return CircleFit(
         center_px=(float(center[0]), float(center[1])),
-        radius_px=float(model.radius),
-        max_residual_px=float(np.abs(model.residuals(points)).max()),
+        radius_px=radius,
         clockwise=_sweeps_clockwise(points, center),
     )
 
