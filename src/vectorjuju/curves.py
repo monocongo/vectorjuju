@@ -70,6 +70,11 @@ def classify(points_px: ArrayLike, dpi: float) -> tuple[Kind, CircleFit | None]:
     A closed run (first point equals last) fits like any other; the writer has
     to emit it as a closed entity rather than an ARC between two coincident
     angles.
+
+    Coordinates finite enough to pass validation can still overflow the
+    chord and fit arithmetic's squared terms; that degrades to the SPLINE
+    fallback rather than raising or trusting a garbage result, regardless of
+    the caller's numpy floating-point error mode.
     """
     points = np.asarray(points_px, dtype=float)
     if points.ndim != 2 or points.shape[1] != 2 or len(points) < 2:
@@ -79,11 +84,15 @@ def classify(points_px: ArrayLike, dpi: float) -> tuple[Kind, CircleFit | None]:
     if not np.isfinite(dpi) or dpi <= 0:
         raise ValueError(f"dpi must be a positive finite number, got {dpi!r}")
 
-    # The tracer simplified this run with _SIMPLIFY_PX at the reference DPI; a
-    # bend below that tolerance is indistinguishable from straight linework.
-    if _chord_deviation(points) <= _scaled(_SIMPLIFY_PX, dpi):
-        return "line", None
-    return "curve", _circle_fit(points)
+    try:
+        # The tracer simplified this run with _SIMPLIFY_PX at the reference
+        # DPI; a bend below that tolerance is indistinguishable from straight
+        # linework.
+        if _chord_deviation(points) <= _scaled(_SIMPLIFY_PX, dpi):
+            return "line", None
+        return "curve", _circle_fit(points)
+    except (FloatingPointError, np.linalg.LinAlgError, ValueError):
+        return "curve", None
 
 
 def _circle_fit(points: NDArray[np.float64]) -> CircleFit | None:
@@ -92,7 +101,9 @@ def _circle_fit(points: NDArray[np.float64]) -> CircleFit | None:
     Three points determine a circle exactly, so a three-point run has no
     residual evidence and goes to the SPLINE fallback instead of a fabricated
     ARC centre. The radius sanity check keeps a fit that cannot span the run's
-    chord (an arc's chord is never longer than its diameter) out.
+    chord (an arc's chord is never longer than its diameter) out. A run whose
+    sweep direction is ambiguous or reverses also falls back rather than
+    fabricate a fit.
     """
     if len(points) < 4:
         return None
@@ -101,27 +112,38 @@ def _circle_fit(points: NDArray[np.float64]) -> CircleFit | None:
         return None
     center = np.asarray(model.center, dtype=float)
     radius = float(model.radius)
-    if float(np.abs(model.residuals(points)).max()) > _MAX_RESIDUAL_RATIO * radius:
+    residual = float(np.abs(model.residuals(points)).max())
+    if not (np.isfinite(radius) and np.isfinite(center).all() and np.isfinite(residual)):
+        return None
+    if residual > _MAX_RESIDUAL_RATIO * radius:
         return None
     if radius < 0.5 * _chord_length(points):
+        return None
+    clockwise = _sweep_direction(points, center)
+    if clockwise is None:
         return None
     return CircleFit(
         center_px=(float(center[0]), float(center[1])),
         radius_px=radius,
-        clockwise=_sweeps_clockwise(points, center),
+        clockwise=clockwise,
     )
 
 
-def _sweeps_clockwise(points: NDArray[np.float64], center: NDArray[np.float64]) -> bool:
-    """Sign of the run's turning about the centre, in the raster's y-down axes.
+def _sweep_direction(points: NDArray[np.float64], center: NDArray[np.float64]) -> bool | None:
+    """Clockwise/counter-clockwise sweep about centre, or None if not one directed arc.
 
-    A positive cross product turns from +x towards +y, which is clockwise as
-    the raster page is viewed. The CAD y flip leaves the page's visual
-    direction unchanged, so this is also the CAD sweep direction.
+    Unwraps each point's angle from centre and requires every step to turn
+    the same way. A reversing run (out and back on the same circle) and a
+    step wide enough to read as either the minor or the major arc both look
+    non-monotonic here, so both refuse a fit instead of guessing a direction.
     """
     radii = points - center
-    cross = radii[:-1, 0] * radii[1:, 1] - radii[:-1, 1] * radii[1:, 0]
-    return bool(cross.sum() > 0.0)
+    angles = np.unwrap(np.arctan2(radii[:, 1], radii[:, 0]))
+    steps = np.sign(np.diff(angles))
+    steps = steps[steps != 0]
+    if len(steps) == 0 or not np.all(steps == steps[0]):
+        return None
+    return bool(steps[0] > 0)
 
 
 def _chord_length(points: NDArray[np.float64]) -> float:

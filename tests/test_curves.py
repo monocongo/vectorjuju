@@ -157,6 +157,47 @@ def test_bow_gate_scales_with_dpi():
     assert classify(bend, DPI / 2)[0] == "curve"
 
 
+def test_reversing_on_one_circle_falls_back_to_spline():
+    # Out and back along the same circle: zero residual and enough bow to
+    # pass the fit gate, but the endpoints coincide and the traversal
+    # reverses -- not one directed ARC.
+    angles = np.radians([0.0, 30.0, 60.0, 90.0, 60.0, 30.0, 0.0])
+    points = np.column_stack([CENTRE[0] + 300.0 * np.cos(angles), CENTRE[1] + 300.0 * np.sin(angles)])
+
+    assert classify(points, DPI) == ("curve", None)
+
+
+def test_major_arc_step_falls_back_instead_of_guessing_direction():
+    # A retained step from 0 deg to 220 deg spans more than a semicircle: a
+    # pairwise cross product reads only the short way between the two radii
+    # and sums to a wrong, confidently-asserted counterclockwise direction
+    # (verified against the old sign-of-cross-product-sum implementation).
+    # The direction is genuinely ambiguous from these points alone, so the
+    # fit must decline rather than assert either direction.
+    angles = np.radians([0.0, 220.0, 230.0, 240.0])
+    points = np.column_stack([CENTRE[0] + 300.0 * np.cos(angles), CENTRE[1] + 300.0 * np.sin(angles)])
+
+    assert classify(points, DPI) == ("curve", None)
+
+
+def test_extreme_finite_coordinates_do_not_crash_the_fit():
+    # Coordinates finite enough to pass the isfinite gate but lopsided enough
+    # that the chord and fit arithmetic's squared terms overflow float64.
+    # Wrapping in errstate(raise) simulates a caller with a stricter numpy
+    # floating-point error mode than this process's default -- classify must
+    # degrade to the spline fallback rather than let that ambient state raise.
+    huge = 1e250
+    points = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [huge, huge]])
+
+    with np.errstate(all="raise"):
+        kind, fit = classify(points, DPI)
+
+    assert kind == "curve"
+    if fit is not None:
+        assert np.isfinite(fit.radius_px)
+        assert all(np.isfinite(c) for c in fit.center_px)
+
+
 @pytest.mark.parametrize("dpi", [0, -1, float("nan"), float("inf")])
 def test_classify_rejects_invalid_dpi(dpi: float):
     with pytest.raises(ValueError):
