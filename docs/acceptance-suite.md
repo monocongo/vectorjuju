@@ -139,6 +139,7 @@ mechanical gate.
 ```
 tests/conftest.py                     session-scoped synthetic sheet; per-media converted fixtures, one output dir each
 tests/test_convert_units.py           U1–U5, no OCR
+tests/test_export.py                  U4 and the A8/A11 writer halves: DXF + sidecar from planted runs, no OCR
 tests/test_convert_acceptance.py      A1–A11, OCR, pytest.mark.acceptance
 tests/acceptance_helpers.py           pt<->px<->cad, label classify, segment/arc comparison, write_overlay()
 tests/test_tracing.py                 U3 straight half, on rasters drawn in the test

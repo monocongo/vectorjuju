@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from vectorjuju.calibrate import Scale, ScaleCalibrationError, calibrate_scale
+    from vectorjuju.export import write_outputs
     from vectorjuju.text import (
         BoundCall,
         ParsedCall,
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
 __version__ = importlib.metadata.version("vectorjuju")
 
 _CALIBRATE_NAMES = {"Scale", "ScaleCalibrationError", "calibrate_scale"}
+_EXPORT_NAMES = {"write_outputs"}
 _TRACING_NAMES = {"Run", "trace_runs"}
 _TEXT_NAMES = {
     "BoundCall",
@@ -47,6 +49,7 @@ __all__ = [
     "parse_call",
     "text_mask",
     "trace_runs",
+    "write_outputs",
 ]
 
 
@@ -64,4 +67,8 @@ def __getattr__(name: str):
         from vectorjuju import calibrate
 
         return getattr(calibrate, name)
+    if name in _EXPORT_NAMES:
+        from vectorjuju import export
+
+        return getattr(export, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
