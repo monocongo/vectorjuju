@@ -31,3 +31,41 @@ jobs:
 
       - name: Test
         run: uv run pytest -v -m "not acceptance"
+
+  acceptance:
+    # A skip is not a pass: the OCR path must run over all three media, and a
+    # red gate here means the MVP is not done (docs/acceptance-suite.md).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # hatch-vcs derives the package version from git tags.
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          enable-cache: true
+
+      - name: Cache docling models
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/docling
+            ~/.cache/huggingface
+          key: docling-${{ hashFiles('uv.lock') }}
+          restore-keys: docling-
+
+      - name: Sync dependencies
+        run: uv sync --locked
+
+      - name: Acceptance (OCR over PDF, TIFF, EXIF-rotated JPG)
+        run: uv run pytest -v -m acceptance
+
+      - name: Upload overlays
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: overlays
+          path: artifacts/overlay-*.png
+          if-no-files-found: warn

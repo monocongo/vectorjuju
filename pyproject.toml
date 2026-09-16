@@ -53,4 +53,4 @@ target-version = "py312"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--strict-markers"
-markers = ["acceptance: OCR path over a generated medium; local only until the CI acceptance job (issue #22)"]
+markers = ["acceptance: full convert() over OCR media; the dedicated CI acceptance job (issue #22)"]
