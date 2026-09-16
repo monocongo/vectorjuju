@@ -58,6 +58,21 @@ def test_single_stroke_l_corner_splits():
     assert len(trace_runs(image, DPI)) == 2
 
 
+def test_shallow_deflection_splits():
+    # A 20 degree deflection between long straight runs is a corner, not the
+    # curvature of an arc; the adjacent-vertex test must keep splitting it.
+    image, draw = _canvas(600, 300)
+    draw.line([(50, 150), (300, 150), (550, 150 - 250 * np.tan(np.radians(20)))], fill=0, width=5, joint="curve")
+
+    assert len(trace_runs(image, DPI)) == 2
+
+
+def test_solid_and_empty_rasters_return_no_runs():
+    assert trace_runs(Image.new("L", (100, 100), 0), DPI) == []
+    assert trace_runs(Image.new("L", (100, 100), 255), DPI) == []
+    assert trace_runs(np.zeros((0, 0), np.uint8), DPI) == []
+
+
 def test_short_thick_run_survives():
     image, draw = _canvas(80, 80)
     draw.line((40, 25, 40, 45), fill=0, width=5)  # 20 px long, 5 px wide
