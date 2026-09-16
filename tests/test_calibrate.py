@@ -11,7 +11,8 @@ import math
 import numpy as np
 import pytest
 
-from vectorjuju.calibrate import Scale, ScaleCalibrationError, calibrate_scale
+from vectorjuju import calibrate
+from vectorjuju.calibrate import Scale, ScaleCalibrationError, _consensus, _ransac_fpp, calibrate_scale
 from vectorjuju.convert import VectorjujuError
 from vectorjuju.synthetic_plat import (
     CURVE_EDGES,
@@ -104,26 +105,58 @@ def test_run_length_follows_the_polyline_not_the_endpoint_chord() -> None:
     assert abs(scale.value - PLANTED_FPP) <= 0.01 * PLANTED_FPP
 
 
-def test_trimmed_runs_are_closed_corner_to_corner_before_measuring() -> None:
-    # A traced run stops short of its corners (skeleton junction geometry, the
-    # slop A7's 8 px end-reach gate allows). On a 400/300 px square trimmed
-    # 7 px per end, raw ratios read +3.6 % to +4.9 % high; closing each end
-    # onto the neighbouring run's centreline has to recover the planted 0.25.
+def _trimmed_square_calls(offset: float = 0.0) -> list[BoundCall]:
+    """A 400/300 px square trimmed 7 px per end, planted at 0.25 ft/px.
+
+    The traced runs stop short of their corners (skeleton junction geometry,
+    the slop A7's 8 px end-reach gate allows): on this square, raw ratios
+    read +3.6 % to +4.9 % high. ``offset`` shifts the square so ends land on
+    the closure cell index's cell edges as well as inside them.
+    """
     corners = [(0.0, 0.0), (400.0, 0.0), (400.0, 300.0), (0.0, 300.0)]
     trim = 7.0
     calls = []
     for i in range(len(corners)):
-        a, b = np.array(corners[i]), np.array(corners[(i + 1) % len(corners)])
-        edge = b - a
-        direction = edge / np.linalg.norm(edge)
-        full_ft = np.linalg.norm(edge) * 0.25  # planted 0.25 ft/px
+        a = np.array(corners[i]) + offset
+        b = np.array(corners[(i + 1) % len(corners)]) + offset
+        direction = (b - a) / np.linalg.norm(b - a)
+        full_ft = np.linalg.norm(b - a) * 0.25  # planted 0.25 ft/px
         calls.append(
             _bound_call(f"N 0°00'00\" E  {full_ft:.2f}'", [tuple(a + trim * direction), tuple(b - trim * direction)])
         )
+    return calls
+
+
+# Closing each end onto the neighbouring run's centreline has to recover the
+# planted 0.25; the raw trimmed runs would read 3.6 % to 4.9 % high. 16 px
+# puts the ends on the closure cell index's cell edges as well as inside them.
+@pytest.mark.parametrize("offset", [0.0, 16.0])
+def test_trimmed_runs_are_closed_corner_to_corner_before_measuring(offset: float) -> None:
+    calls = _trimmed_square_calls(offset)
 
     scale = calibrate_scale(calls)
 
     assert abs(scale.value - 0.25) <= 0.01 * 0.25
+
+
+def test_corner_closure_does_not_scan_distant_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A distant run is past the closure cap and can never be a neighbour, so
+    # the per-end scans must never touch it: at the text side's 4,000-run cap,
+    # every end scanning every run's full polyline is the quadratic blow-up.
+    far = _bound_call(f"N 0°00'00\" E  {100.0:.2f}'", [(6000.0, 6000.0), (6400.0, 6000.0)])
+    scanned: list[np.ndarray] = []
+    closest_point = calibrate._closest_point
+
+    def spy(point: np.ndarray, points: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+        scanned.append(points)
+        return closest_point(point, points)
+
+    monkeypatch.setattr(calibrate, "_closest_point", spy)
+
+    scale = calibrate_scale([*_trimmed_square_calls(), far])
+
+    assert abs(scale.value - 0.25) <= 0.01 * 0.25
+    assert not any(points is far.run.points_px for points in scanned)
 
 
 @pytest.mark.parametrize("count", [0, 1, 2])
@@ -137,14 +170,40 @@ def test_curve_refs_and_unmeasurable_runs_do_not_count_as_usable() -> None:
     good = [_call(100.0, 100.0 * PLANTED_FPP) for _ in range(3)]
     curve_ref = _bound_call("C1", [(0.0, 0.0), (100.0, 0.0)])
     zero_run = _call(0.0, 100.0)  # a call whose run has no measurable length
+    empty_run = _bound_call(f"N 0°00'00\" E  {100.0:.2f}'", [])  # ...and one with no geometry at all
 
-    # Neither fake sample can calibrate, but the three real ones still do.
-    scale = calibrate_scale([curve_ref, zero_run, *good])
+    # None of the fakes can calibrate, but the three real ones still do.
+    scale = calibrate_scale([curve_ref, zero_run, empty_run, *good])
     assert abs(scale.value - PLANTED_FPP) <= 0.01 * PLANTED_FPP
 
-    # Drop to two real samples and the unusable pair is not mistaken for a third.
+    # Drop to two real samples and the unusable trio is not mistaken for a third.
     with pytest.raises(ScaleCalibrationError):
-        calibrate_scale([curve_ref, zero_run, *good[:2]])
+        calibrate_scale([curve_ref, zero_run, empty_run, *good[:2]])
+
+
+def test_ratio_overflow_raises_instead_of_fitting_an_empty_consensus() -> None:
+    # Both operands are finite and positive, but their quotient is not: no
+    # hypothesis has a consensus, so this must fail as a calibration error
+    # rather than divide by an empty inlier set.
+    calls = [_call(1e-100, 1e250) for _ in range(3)]
+
+    with pytest.raises(ScaleCalibrationError):
+        calibrate_scale(calls)
+
+
+def test_refinement_converges_on_membership_not_just_its_size() -> None:
+    # The least-squares refit of one hypothesis's inliers moves the 3 % window
+    # onto a different set of the same size; a same-size swap is not a
+    # fixpoint, so the returned fit must be the one its reported inliers
+    # accept -- not the superseded set's fit.
+    samples = [(1.0, 4.06), (1.0, 1.09), (1.0, 1.07), (4.0, 1.11), (4.0, 4.56), (4.0, 4.46)]
+
+    fpp, inliers = _ransac_fpp(samples)
+
+    lengths = np.array([length for length, _ in samples])
+    distances = np.array([distance for _, distance in samples])
+    assert int(inliers.sum()) == 2
+    assert np.array_equal(_consensus(lengths, distances, fpp), inliers)
 
 
 def test_disagreeing_calls_raise_instead_of_averaging() -> None:

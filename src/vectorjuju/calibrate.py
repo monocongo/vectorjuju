@@ -14,7 +14,9 @@ acceptance suite's 8 px end-reach gates allow. Its raw length therefore
 overshoots the scale by a few percent, so each end is first extended to the
 intersection with the neighbouring bound run's centreline -- corner-to-corner
 is what a recorded distance measures. That extension is measurement-only;
-the emitted geometry keeps the tracer's own endpoints.
+the emitted geometry keeps the tracer's own endpoints. A cell index keeps
+each end's search on the runs whose geometry is actually near it, so closure
+costs per run, not per run pair.
 
 Nothing unbound reaches here, so curve-table cells (which never bind: a
 radius has no bearing, and their borders are rejected by the tracer) cannot
@@ -124,18 +126,53 @@ def _closes_end(points: np.ndarray, at_start: bool, neighbours: Sequence[np.ndar
     return best[1] if best[1] is not None else end
 
 
-def _closed_run_length_px(run: Run, runs: Sequence[Run], dpi: float) -> float:
+def _cell_index(runs: Sequence[Run], cell_px: float) -> dict[tuple[int, int], list[int]]:
+    """Run indices by raster cell, so closure looks up neighbours instead of
+    scanning every other run's polyline at every end."""
+    index: dict[tuple[int, int], list[int]] = {}
+    for i, run in enumerate(runs):
+        for a, b in pairwise(run.points_px):
+            x0, x1 = min(float(a[0]), float(b[0])), max(float(a[0]), float(b[0]))
+            y0, y1 = min(float(a[1]), float(b[1])), max(float(a[1]), float(b[1]))
+            for cx in range(int(x0 // cell_px), int(x1 // cell_px) + 1):
+                for cy in range(int(y0 // cell_px), int(y1 // cell_px) + 1):
+                    index.setdefault((cx, cy), []).append(i)
+    return index
+
+
+def _nearby_runs(
+    index: dict[tuple[int, int], list[int]], cell_px: float, point: np.ndarray, runs: Sequence[Run], skip: int
+) -> list[np.ndarray]:
+    """Polylines of the runs in the 3x3 cell block around ``point``.
+
+    The cell is twice the closure cap, so every run whose centreline comes
+    within reach of ``point`` -- the only ones ``_closes_end`` can use -- is
+    inside that block.
+    """
+    cx, cy = int(point[0] // cell_px), int(point[1] // cell_px)
+    near: set[int] = set()
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            near.update(index.get((cx + dx, cy + dy), ()))
+    near.discard(skip)
+    return [runs[i].points_px for i in sorted(near)]
+
+
+def _closed_run_length_px(
+    run_index: int, runs: Sequence[Run], index: dict[tuple[int, int], list[int]], cap: float
+) -> float:
     """Run length corner to corner: each end closed onto the neighbouring run.
 
     ponytail: closure is best-effort -- an end whose neighbour never bound
     (no call of its own) stays raw, and RANSAC then votes that sample out.
     """
-    points = run.points_px
-    cap = _scaled(_CORNER_EXTEND_PX, dpi)
-    neighbours = [other.points_px for other in runs if other is not run]
+    points = runs[run_index].points_px
+    if len(points) < 2:
+        return 0.0  # nothing measurable to close; the caller's length > 0 gate skips it
+    cell = 2 * cap
     closed = points.copy()
-    closed[0] = _closes_end(points, True, neighbours, cap)
-    closed[-1] = _closes_end(points, False, neighbours, cap)
+    closed[0] = _closes_end(points, True, _nearby_runs(index, cell, points[0], runs, run_index), cap)
+    closed[-1] = _closes_end(points, False, _nearby_runs(index, cell, points[-1], runs, run_index), cap)
     return sum(math.dist(a, b) for a, b in pairwise(closed))
 
 
@@ -146,51 +183,72 @@ def _usable_samples(bound_calls: Sequence[BoundCall], dpi: float) -> list[tuple[
     divides by zero; both are skipped, not guessed at.
     """
     runs = [bound.run for bound in bound_calls]
+    cap = _scaled(_CORNER_EXTEND_PX, dpi)
+    index = _cell_index(runs, 2 * cap)
     samples = []
-    for bound in bound_calls:
+    for i, bound in enumerate(bound_calls):
         distance = bound.call.distance_ft
         if bound.call.kind != "bearing_distance" or distance is None:
             continue
-        length = _closed_run_length_px(bound.run, runs, dpi)
+        length = _closed_run_length_px(i, runs, index, cap)
         if math.isfinite(distance) and distance > 0 and math.isfinite(length) and length > 0:
             samples.append((length, distance))
     return samples
 
 
-def _consensus(samples: Sequence[tuple[float, float]], fpp: float) -> list[tuple[float, float]]:
-    return [sample for sample in samples if abs(sample[0] * fpp - sample[1]) <= _INLIER_REL_TOL * sample[1]]
+def _consensus(lengths: np.ndarray, distances: np.ndarray, fpp: float) -> np.ndarray:
+    """Boolean mask of the samples whose own recorded distance accepts ``fpp``."""
+    return np.abs(lengths * fpp - distances) <= _INLIER_REL_TOL * distances
 
 
-def _fit(samples: Sequence[tuple[float, float]]) -> float:
+def _fit(lengths: np.ndarray, distances: np.ndarray, inliers: np.ndarray) -> float:
     """Least-squares units-per-pixel through the origin (feet = k * px)."""
-    return sum(length * distance for length, distance in samples) / sum(length * length for length, _ in samples)
+    return float(np.dot(lengths[inliers], distances[inliers]) / np.dot(lengths[inliers], lengths[inliers]))
 
 
-def _ransac_fpp(samples: Sequence[tuple[float, float]]) -> tuple[float, int]:
-    """Through-origin RANSAC over the samples; returns (fpp, consensus size).
+def _ransac_fpp(samples: Sequence[tuple[float, float]]) -> tuple[float, np.ndarray]:
+    """Through-origin RANSAC over the samples; returns (fpp, inlier mask).
 
     The model has one parameter (the ratio), so every sample is itself a
     minimal hypothesis: trying each in turn is exhaustive RANSAC -- no random
     subset can find a hypothesis this misses -- and deterministic, which the
     sidecar's byte-identity gate (A8) needs. Ties keep the earlier sample's
-    hypothesis.
+    hypothesis. Consensus and residual arithmetic is vectorized, so the
+    quadratic term is the usable-call count (bounded by the text side's
+    ``_MAX_RUNS_FOR_TEXT``) rather than every run's geometry.
+
+    Refinement converges on the inlier membership itself, not its size: a
+    swapped set of the same size is not a fixpoint, and the returned fit must
+    be one its own reported inliers accept.
     """
-    best_key, best_inliers = (0, 0.0), []
-    for length, distance in samples:
+    lengths = np.array([length for length, _ in samples])
+    distances = np.array([distance for _, distance in samples])
+    empty = np.zeros(len(samples), dtype=bool)
+
+    best_key, best_inliers = (0, 0.0), empty
+    for length, distance in zip(lengths.tolist(), distances.tolist(), strict=True):
         fpp = distance / length
-        inliers = _consensus(samples, fpp)
-        residual = sum((l * fpp - d) ** 2 for l, d in inliers)
-        key = (len(inliers), -residual)
+        if not math.isfinite(fpp):
+            continue  # finite operands, overflowing quotient: no sample can agree with it
+        inliers = _consensus(lengths, distances, fpp)
+        residual = float(np.sum((lengths[inliers] * fpp - distances[inliers]) ** 2))
+        key = (int(inliers.sum()), -residual)
         if key > best_key:
             best_key, best_inliers = key, inliers
 
+    if not best_inliers.any():
+        return 0.0, empty  # every hypothesis was a non-finite ratio
+
     for _ in range(_MAX_REFINEMENTS):
-        fpp = _fit(best_inliers)
-        grown = _consensus(samples, fpp)
-        if len(grown) == len(best_inliers):
-            break
+        fpp = _fit(lengths, distances, best_inliers)
+        if not math.isfinite(fpp):
+            return 0.0, empty  # least-squares overflowed; no consensus to report
+        grown = _consensus(lengths, distances, fpp)
+        if np.array_equal(grown, best_inliers):
+            return fpp, best_inliers
         best_inliers = grown
-    return fpp, len(best_inliers)
+    fpp = _fit(lengths, distances, best_inliers)
+    return (fpp, best_inliers) if math.isfinite(fpp) else (0.0, empty)
 
 
 def calibrate_scale(bound_calls: Sequence[BoundCall], *, scale: float | None = None, dpi: float = 200.0) -> Scale:
@@ -215,8 +273,9 @@ def calibrate_scale(bound_calls: Sequence[BoundCall], *, scale: float | None = N
             "scale, and no scale override was given"
         )
 
-    fpp, consensus = _ransac_fpp(samples)
-    if consensus < _MIN_CONSENSUS:
+    fpp, inliers = _ransac_fpp(samples)
+    consensus = int(inliers.sum())
+    if consensus < _MIN_CONSENSUS or not math.isfinite(fpp):
         raise ScaleCalibrationError(
             f"no {_MIN_CONSENSUS} of {len(samples)} usable calls agree on a scale (best consensus: {consensus})"
         )
