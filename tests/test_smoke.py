@@ -11,3 +11,11 @@ def test_tracing_api_is_exported():
 
     assert trace_runs is tracing.trace_runs
     assert Run is tracing.Run
+
+
+def test_calibration_api_is_exported():
+    from vectorjuju import Scale, ScaleCalibrationError, calibrate, calibrate_scale
+
+    assert calibrate_scale is calibrate.calibrate_scale
+    assert Scale is calibrate.Scale
+    assert ScaleCalibrationError is calibrate.ScaleCalibrationError

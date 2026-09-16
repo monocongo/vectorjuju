@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from vectorjuju.calibrate import calibrate_scale
 from vectorjuju.synthetic_plat import PAGE_H, RENDER_DPI, generate_sheet
 from vectorjuju.text import BoundCall, TextItem, bind_calls, extract_text, normalize_ocr, page_items
 from vectorjuju.tracing import Run, trace_runs
@@ -123,6 +124,22 @@ def test_each_planted_curve_ref_binds_exactly_once(
     curve_calls = [bc for bc in bound if bc.call.kind == "curve_ref"]
     bound_ids = [bc.call.curve_id for bc in curve_calls]
     assert sorted(bound_ids) == sorted(curve_refs)  # each ref binds exactly once, none extra
+
+
+def test_calibration_recovers_the_planted_scale_from_traced_runs(
+    bound_and_unbound: tuple[list[BoundCall], list[TextItem], dict],
+) -> None:
+    """A1's scale half at the run level: the parsed calls and the traced runs
+    they bound to recover the planted feet-per-pixel inside the 1 % budget.
+    The full gate reads the same number off the sidecar once `convert()`
+    writes one (issue #22)."""
+    bound, _unbound, truth = bound_and_unbound
+    planted = 72.0 / (truth["scale_pt_per_ft"] * RENDER_DPI)
+
+    scale = calibrate_scale(bound, dpi=RENDER_DPI)
+
+    assert scale.method == "ransac"
+    assert abs(scale.value - planted) <= 0.01 * planted
 
 
 def test_no_distractor_or_table_cell_text_binds(

@@ -4,6 +4,7 @@ import importlib.metadata
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from vectorjuju.calibrate import Scale, ScaleCalibrationError, calibrate_scale
     from vectorjuju.text import (
         BoundCall,
         ParsedCall,
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
 
 __version__ = importlib.metadata.version("vectorjuju")
 
+_CALIBRATE_NAMES = {"Scale", "ScaleCalibrationError", "calibrate_scale"}
 _TRACING_NAMES = {"Run", "trace_runs"}
 _TEXT_NAMES = {
     "BoundCall",
@@ -34,9 +36,12 @@ __all__ = [
     "BoundCall",
     "ParsedCall",
     "Run",
+    "Scale",
+    "ScaleCalibrationError",
     "TextItem",
     "__version__",
     "bind_calls",
+    "calibrate_scale",
     "extract_text",
     "page_items",
     "parse_call",
@@ -46,7 +51,7 @@ __all__ = [
 
 
 def __getattr__(name: str):
-    """Import the tracing/text APIs lazily: `import vectorjuju` must not need cv2/skimage/docling."""
+    """Import the tracing/text/calibration APIs lazily: `import vectorjuju` must not need cv2/skimage/docling."""
     if name in _TRACING_NAMES:
         from vectorjuju import tracing
 
@@ -55,4 +60,8 @@ def __getattr__(name: str):
         from vectorjuju import text
 
         return getattr(text, name)
+    if name in _CALIBRATE_NAMES:
+        from vectorjuju import calibrate
+
+        return getattr(calibrate, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
