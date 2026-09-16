@@ -6,8 +6,11 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = [
+    "numpy>=2.5.3",
+    "opencv-python-headless>=5.0.0.93",
     "pillow>=12.3.0",
     "pypdfium2>=5.13.0",
+    "scikit-image>=0.26.0",
 ]
 
 [dependency-groups]
