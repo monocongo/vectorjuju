@@ -375,25 +375,41 @@ def warp_band(
     return Image.fromarray(warped), m
 
 
-def _ocr_band(band: Image.Image) -> tuple[str, tuple[float, float, float, float] | None]:
-    """OCR one band; returns its text and the band-local bbox spanning every
-    OCR'd text region that contributed to it (``None`` if none did)."""
+def _ocr_band(band: Image.Image) -> list[TextItem]:
+    """OCR one band into one TextItem per region, boxes in the band's pixels."""
     ocr, factor = _ocr_image(band)
     with TemporaryDirectory() as tmp:
         path = Path(tmp) / "band.png"
         ocr.save(path, format="PNG")
         doc = _convert_path(path)
     if doc is None:
-        return "", None
-    items = _doc_items(doc, ocr.size[1], "crop", factor)
-    text = " ".join(item.text for item in items)
+        return []
+    return _doc_items(doc, ocr.size[1], "crop", factor)
+
+
+def _band_call(items: Sequence[TextItem]) -> tuple[str, tuple[float, float, float, float]] | None:
+    """The band's own call, or ``None`` when no read parses as one.
+
+    The band's regions are tried joined first -- a bearing call is routinely
+    split across OCR regions -- and then one at a time. A curve ref is a
+    two-character read that an engine can return beside a spurious region (a
+    sliver of the very line it labels), and joining that in would fail a read
+    the band already had.
+    """
     if not items:
-        return text, None
-    x0 = min(item.box_px[0] for item in items)
-    y0 = min(item.box_px[1] for item in items)
-    x1 = max(item.box_px[2] for item in items)
-    y1 = max(item.box_px[3] for item in items)
-    return text, (x0, y0, x1, y1)
+        return None
+    joined = " ".join(item.text for item in items)
+    if parse_call(joined) is not None:
+        return joined, (
+            min(item.box_px[0] for item in items),
+            min(item.box_px[1] for item in items),
+            max(item.box_px[2] for item in items),
+            max(item.box_px[3] for item in items),
+        )
+    for item in items:
+        if parse_call(item.text) is not None:
+            return item.text, item.box_px
+    return None
 
 
 def _band_box_to_image(
@@ -442,22 +458,19 @@ def _crop_item(image: Image.Image, run: Run, dpi: float) -> TextItem | None:
     half_h = min(_scaled(110.0, dpi), _MAX_CROP_SIDE_PX / 2)
     band, m = warp_band(image, (float(x0), float(y0), float(x1), float(y1)), center, half_len, half_h)
 
-    text, box_local = _ocr_band(band)
+    picked = _band_call(_ocr_band(band))
     rotated = False
-    if parse_call(text) is None:
+    if picked is None:
         # A traced run has no arrowhead; try the band's own 180-degree twin
         # and keep it only if it actually parses -- prefer a read that
         # succeeds over one with merely more characters (prototypes/
         # diagonal_call_labels.py's alnum-count tie-break is a measured
         # crutch: commit 50e54ed shows it flips on stray OCR periods).
-        rotated_text, rotated_box_local = _ocr_band(band.rotate(180))
-        if parse_call(rotated_text) is not None:
-            text, box_local, rotated = rotated_text, rotated_box_local, True
-
-    if parse_call(text) is None:
+        picked = _band_call(_ocr_band(band.rotate(180)))
+        rotated = picked is not None
+    if picked is None:
         return None
-    # box_local is only ever None when text is "" (no OCR'd region
-    # contributed to it), and an empty text never survives parse_call above.
+    text, box_local = picked
     box_px = _band_box_to_image(box_local, band.size, m, rotated=rotated)
     return TextItem(text=text, box_px=box_px, source="crop")
 
