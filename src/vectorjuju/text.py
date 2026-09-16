@@ -12,6 +12,7 @@ force-bound.
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 import unicodedata
@@ -29,6 +30,8 @@ from scipy.optimize import linear_sum_assignment
 
 from vectorjuju.tracing import Run
 
+_logger = logging.getLogger(__name__)
+
 _REFERENCE_DPI = 200.0
 
 # Physically derived from the synthetic fixture (synthetic_plat.py): a label
@@ -37,6 +40,15 @@ _REFERENCE_DPI = 200.0
 # headroom for OCR box imprecision while staying far short of the curve
 # table, which sits well outside any parcel edge's vicinity.
 _BIND_RADIUS_PX = 60.0
+
+# Bounds on extract_text()'s crop-pass fan-out and per-crop allocation.
+# _MAX_CROP_SIDE_PX caps warpAffine()'s output buffer regardless of a run's
+# span or an oversized dpi; _MAX_RUNS_FOR_TEXT caps total OCR conversions
+# (1-2 per run) a call to extract_text() will start. ponytail: flat caps, not
+# a budget derived from image size or a timeout -- a sheet that legitimately
+# needs more than this needs batched/async OCR, not a bigger constant.
+_MAX_CROP_SIDE_PX = 4000.0
+_MAX_RUNS_FOR_TEXT = 4000
 
 # Carried from prototypes/diagonal_call_labels.py:_PUNCT. Order matters: NFKC
 # folds the masculine ordinal indicator to a letter "o" and splits the double
@@ -161,6 +173,18 @@ def parse_call(raw: str) -> ParsedCall | None:
     if not distance_match:
         return None
 
+    # Reject a call glued to a separate, whitespace-delimited word -- an
+    # annotation like "NOTE: N 45° E 100' TYPICAL" -- but tolerate noise
+    # merged directly onto the call with no gap at all (measured: OCR
+    # occasionally misreads a stray mark right before the quadrant letter as
+    # an extra character, e.g. "WN 35°09'59\" E 107.65'"). Whitespace
+    # adjacent to the boundary is what marks a residual as its own token;
+    # normalize_ocr already strips the read's own outer whitespace, so a
+    # non-empty residual with no adjacent space is glued-on noise, not text.
+    before, after = text[: bearing_match.start()], text[distance_match.end() :]
+    if (before and before[-1].isspace()) or (after and after[0].isspace()):
+        return None
+
     suspects = []
     if deg_mark != "°":
         suspects.append("degree-mark")
@@ -222,15 +246,36 @@ def _converter():
 
 
 def _convert_path(path: Path):
+    # One unreadable page or crop must not kill the run, but the failure must
+    # stay observable: logged here rather than silently folded into "no text
+    # found" (an unavailable model asset or OCR init error looks identical to
+    # a blank page otherwise).
     try:
         return _converter().convert(str(path)).document
-    except Exception:  # noqa: BLE001 -- one unreadable page or crop must not kill the run
+    except Exception:
+        _logger.warning("docling conversion failed for %s", path, exc_info=True)
         return None
 
 
-def _page_items(image: Image.Image) -> list[TextItem]:
+def _doc_items(doc, height: int, source: str) -> list[TextItem]:
+    items = []
+    for t in doc.texts:
+        if not t.prov or not t.text.strip():
+            continue
+        b = t.prov[0].bbox
+        top, bottom = max(b.t, b.b), min(b.t, b.b)  # docling: bottom-left origin
+        items.append(TextItem(text=t.text, box_px=(b.l, height - top, b.r, height - bottom), source=source))
+    return items
+
+
+def page_items(image: Image.Image) -> list[TextItem]:
     """Full-page OCR: the text-exclusion-mask source and the catch-all for
-    leftover text (monuments, curve table, title block) that never binds."""
+    leftover text (monuments, curve table, title block) that never binds.
+
+    Pass the result to both ``text_mask()`` (before tracing) and
+    ``extract_text(..., page_items=...)`` (after) to run this page-pass once
+    instead of once per call.
+    """
     page_h = image.size[1]
     with TemporaryDirectory() as tmp:
         path = Path(tmp) / "page.png"
@@ -238,14 +283,10 @@ def _page_items(image: Image.Image) -> list[TextItem]:
         doc = _convert_path(path)
     if doc is None:
         return []
-    items = []
-    for t in doc.texts:
-        if not t.prov or not t.text.strip():
-            continue
-        b = t.prov[0].bbox
-        top, bottom = max(b.t, b.b), min(b.t, b.b)  # docling: bottom-left origin
-        items.append(TextItem(text=t.text, box_px=(b.l, page_h - top, b.r, page_h - bottom), source="page"))
-    return items
+    return _doc_items(doc, page_h, "page")
+
+
+_page_items = page_items  # internal alias: extract_text's page_items kwarg shadows the module-level name
 
 
 def warp_band(
@@ -254,9 +295,14 @@ def warp_band(
     center: tuple[float, float],
     half_len: float,
     half_h: float,
-) -> Image.Image:
+) -> tuple[Image.Image, np.ndarray]:
     """Deskew an upright band centred on ``center`` with the source x axis
     along ``seg``. No mirroring: the linear part is a rotation.
+
+    Returns the band and the affine matrix ``m`` mapping ``image`` pixel
+    coordinates to band pixel coordinates (``cv2.invertAffineTransform(m)``
+    maps back), so a caller can place an OCR box found in the band back onto
+    the source image.
 
     Ported from prototypes/diagonal_call_labels.py -- issue #8's measured fix
     for rotated labels: plain axis-aligned crops and full-page OCR each
@@ -275,17 +321,47 @@ def warp_band(
     dst = [(0.0, 0.0), (float(w), 0.0), (0.0, float(h))]
     m = cv2.getAffineTransform(np.float32(src), np.float32(dst))
     warped = cv2.warpAffine(np.asarray(image), m, (w, h), flags=cv2.INTER_CUBIC, borderValue=(255, 255, 255))
-    return Image.fromarray(warped)
+    return Image.fromarray(warped), m
 
 
-def _ocr_band(band: Image.Image) -> str:
+def _ocr_band(band: Image.Image) -> tuple[str, tuple[float, float, float, float] | None]:
+    """OCR one band; returns its text and the band-local bbox spanning every
+    OCR'd text region that contributed to it (``None`` if none did)."""
     with TemporaryDirectory() as tmp:
         path = Path(tmp) / "band.png"
         band.save(path, format="PNG")
         doc = _convert_path(path)
     if doc is None:
-        return ""
-    return " ".join(t.text for t in doc.texts)
+        return "", None
+    items = _doc_items(doc, band.size[1], "crop")
+    text = " ".join(item.text for item in items)
+    if not items:
+        return text, None
+    x0 = min(item.box_px[0] for item in items)
+    y0 = min(item.box_px[1] for item in items)
+    x1 = max(item.box_px[2] for item in items)
+    y1 = max(item.box_px[3] for item in items)
+    return text, (x0, y0, x1, y1)
+
+
+def _band_box_to_image(
+    box: tuple[float, float, float, float],
+    band_size: tuple[int, int],
+    m: np.ndarray,
+    *,
+    rotated: bool,
+) -> tuple[float, float, float, float]:
+    """Map a band-local OCR box back onto the source image ``warp_band`` cropped
+    it from, undoing the 180-degree retry rotation (if any) and the affine."""
+    x0, y0, x1, y1 = box
+    if rotated:
+        w, h = band_size
+        x0, x1 = w - x1, w - x0
+        y0, y1 = h - y1, h - y0
+    corners = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float64)
+    m_inv = cv2.invertAffineTransform(m.astype(np.float64))
+    mapped = corners @ m_inv[:, :2].T + m_inv[:, 2]
+    return _bbox(mapped)
 
 
 def _crop_item(image: Image.Image, run: Run, dpi: float) -> TextItem | None:
@@ -302,7 +378,7 @@ def _crop_item(image: Image.Image, run: Run, dpi: float) -> TextItem | None:
     # ponytail: band centred on the run's own midpoint, matching the
     # synthetic fixture's label placement; an off-centre real-plat label
     # needs a locator pass to recentre the band, not just a wider one.
-    half_len = max(length * 0.4, _scaled(20.0, dpi))
+    half_len = min(max(length * 0.4, _scaled(20.0, dpi)), _MAX_CROP_SIDE_PX / 2)
     # ponytail: a curve-ref label sits at the arc's bulge, not on the chord,
     # so its offset from the run's own endpoint-to-endpoint chord grows with
     # the curve's sagitta -- unboundedly as radius approaches chord/2. 110px
@@ -311,23 +387,27 @@ def _crop_item(image: Image.Image, run: Run, dpi: float) -> TextItem | None:
     # a materially tighter curve on a long chord can still clip. Once curve
     # classification lands (issue #18), size this from the run's actual
     # fitted geometry instead of a flat constant.
-    half_h = _scaled(110.0, dpi)
-    band = warp_band(image, (float(x0), float(y0), float(x1), float(y1)), center, half_len, half_h)
+    half_h = min(_scaled(110.0, dpi), _MAX_CROP_SIDE_PX / 2)
+    band, m = warp_band(image, (float(x0), float(y0), float(x1), float(y1)), center, half_len, half_h)
 
-    text = _ocr_band(band)
+    text, box_local = _ocr_band(band)
+    rotated = False
     if parse_call(text) is None:
         # A traced run has no arrowhead; try the band's own 180-degree twin
         # and keep it only if it actually parses -- prefer a read that
         # succeeds over one with merely more characters (prototypes/
         # diagonal_call_labels.py's alnum-count tie-break is a measured
         # crutch: commit 50e54ed shows it flips on stray OCR periods).
-        rotated_text = _ocr_band(band.rotate(180))
+        rotated_text, rotated_box_local = _ocr_band(band.rotate(180))
         if parse_call(rotated_text) is not None:
-            text = rotated_text
+            text, box_local, rotated = rotated_text, rotated_box_local, True
 
     if parse_call(text) is None:
         return None
-    return TextItem(text=text, box_px=_bbox(pts), source="crop")
+    # box_local is only ever None when text is "" (no OCR'd region
+    # contributed to it), and an empty text never survives parse_call above.
+    box_px = _band_box_to_image(box_local, band.size, m, rotated=rotated)
+    return TextItem(text=text, box_px=box_px, source="crop")
 
 
 def text_mask(items: Sequence[TextItem], shape: tuple[int, int]) -> np.ndarray:
@@ -344,13 +424,28 @@ def text_mask(items: Sequence[TextItem], shape: tuple[int, int]) -> np.ndarray:
     return mask
 
 
-def extract_text(image: Image.Image, runs: Sequence[Run], *, dpi: float = 200.0) -> list[TextItem]:
+def extract_text(
+    image: Image.Image,
+    runs: Sequence[Run],
+    *,
+    dpi: float = 200.0,
+    page_items: Sequence[TextItem] | None = None,
+) -> list[TextItem]:
     """Page-pass items plus one crop-pass item per run, deskewed along that
     run's own direction. Every run is cropped, not just runs near a page-pass
     read: full-page OCR missed the short curve-ref labels (``C1``/``C2``) on
     every medium in issues #7 and #8, so a page-driven crop loop would too.
+
+    ``page_items`` reuses an already-computed page pass -- e.g. the one a
+    caller ran to build ``text_mask()``'s exclusion mask before tracing --
+    instead of running docling over the full page a second time. Pass
+    ``vectorjuju.text.page_items(image)``'s own result straight through.
     """
-    items = _page_items(image)
+    if not math.isfinite(dpi) or dpi <= 0:
+        raise ValueError(f"extract_text requires a finite dpi > 0, got {dpi!r}")
+    if len(runs) > _MAX_RUNS_FOR_TEXT:
+        raise ValueError(f"extract_text requires len(runs) <= {_MAX_RUNS_FOR_TEXT}, got {len(runs)}")
+    items = list(page_items) if page_items is not None else _page_items(image)
     for run in runs:
         item = _crop_item(image, run, dpi)
         if item is not None:

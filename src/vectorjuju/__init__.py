@@ -4,13 +4,31 @@ import importlib.metadata
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from vectorjuju.text import BoundCall, ParsedCall, TextItem, bind_calls, extract_text, parse_call
+    from vectorjuju.text import (
+        BoundCall,
+        ParsedCall,
+        TextItem,
+        bind_calls,
+        extract_text,
+        page_items,
+        parse_call,
+        text_mask,
+    )
     from vectorjuju.tracing import Run, trace_runs
 
 __version__ = importlib.metadata.version("vectorjuju")
 
 _TRACING_NAMES = {"Run", "trace_runs"}
-_TEXT_NAMES = {"BoundCall", "ParsedCall", "TextItem", "bind_calls", "extract_text", "parse_call"}
+_TEXT_NAMES = {
+    "BoundCall",
+    "ParsedCall",
+    "TextItem",
+    "bind_calls",
+    "extract_text",
+    "page_items",
+    "parse_call",
+    "text_mask",
+}
 
 __all__ = [
     "BoundCall",
@@ -20,7 +38,9 @@ __all__ = [
     "__version__",
     "bind_calls",
     "extract_text",
+    "page_items",
     "parse_call",
+    "text_mask",
     "trace_runs",
 ]
 

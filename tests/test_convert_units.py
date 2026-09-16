@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from pathlib import Path
 
@@ -11,9 +12,10 @@ import pytest
 from PIL import Image, ImageChops, ImageStat
 from reportlab.pdfgen import canvas
 
+from vectorjuju import text as text_module
 from vectorjuju.convert import UnsupportedInputError, VectorjujuError, cad_to_px, load_raster, px_to_cad
 from vectorjuju.synthetic_plat import PAGE_H, PAGE_W, PARCEL_FT, RENDER_DPI, bearing_distance, generate_sheet
-from vectorjuju.text import TextItem, bind_calls, normalize_ocr, parse_call
+from vectorjuju.text import TextItem, bind_calls, extract_text, normalize_ocr, parse_call
 from vectorjuju.tracing import Run
 
 EXPECTED_SIZE = (round(PAGE_W * RENDER_DPI / 72), round(PAGE_H * RENDER_DPI / 72))  # 1700 x 2200
@@ -265,6 +267,30 @@ def test_parse_call_rejects_a_distance_not_immediately_after_the_bearing() -> No
 
 
 @pytest.mark.parametrize(
+    "raw",
+    [
+        "NOTE: N 45° E 100.00' TYPICAL",  # call-shaped substring inside an annotation
+        "SEE N 45° E 100.00'",
+        "N 45° E 100.00' PER PLAT",
+    ],
+)
+def test_parse_call_rejects_a_call_embedded_in_surrounding_text(raw: str) -> None:
+    # A bearing+distance must be the read's entire text -- otherwise this
+    # defeats the non-call filtering test_parse_call_rejects_non_calls checks
+    # and can attach an authoritative call to the wrong run.
+    assert parse_call(raw) is None
+
+
+def test_parse_call_tolerates_a_stray_character_glued_onto_the_bearing() -> None:
+    # Measured OCR noise (a misread tick mark fused onto the quadrant
+    # letter, no whitespace gap) must still parse -- unlike a genuine
+    # separate annotation word, which the isolation check above rejects.
+    call = parse_call("WN 35°09'59\" E 107.65'")
+    assert call is not None
+    assert math.isclose(call.distance_ft, 107.65)
+
+
+@pytest.mark.parametrize(
     ("raw", "suspect"),
     [
         ('N 87°42\'34" E  200.16"', "foot-mark"),  # foot mark misread as inch mark
@@ -296,6 +322,50 @@ def test_curve_ref_regex_rejects_embedded_non_whitespace_content(raw: str) -> No
 
 def test_normalize_ocr_folds_punctuation_confusables_before_case_folding() -> None:
     assert normalize_ocr("n 45º30′ e") == "N 45°30' E"
+
+
+def test_convert_path_logs_a_conversion_failure_instead_of_hiding_it(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    # A dependency/init failure must stay observable, not collapse into the
+    # same empty result a legitimate no-text page returns.
+    class _BrokenConverter:
+        def convert(self, _path: str):
+            raise RuntimeError("model assets unavailable")
+
+    monkeypatch.setattr(text_module, "_converter", lambda: _BrokenConverter())
+
+    with caplog.at_level(logging.WARNING, logger=text_module.__name__):
+        result = text_module._convert_path(tmp_path / "page.png")
+
+    assert result is None
+    assert "docling conversion failed" in caplog.text
+
+
+def test_extract_text_rejects_non_finite_or_nonpositive_dpi() -> None:
+    for bad_dpi in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="dpi"):
+            extract_text(object(), [], dpi=bad_dpi)
+
+
+def test_extract_text_rejects_too_many_runs() -> None:
+    runs = [Run(points_px=np.zeros((2, 2)))] * (text_module._MAX_RUNS_FOR_TEXT + 1)
+    with pytest.raises(ValueError, match="runs"):
+        extract_text(object(), runs, dpi=200.0)
+
+
+def test_extract_text_reuses_supplied_page_items_instead_of_a_second_page_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fail_if_called(_image: object) -> list[TextItem]:
+        raise AssertionError("extract_text must not re-run the page pass when page_items is supplied")
+
+    monkeypatch.setattr(text_module, "_page_items", _fail_if_called)
+    supplied = [TextItem(text="C1", box_px=(0.0, 0.0, 1.0, 1.0), source="page")]
+
+    items = extract_text(object(), [], dpi=200.0, page_items=supplied)
+
+    assert items == supplied
 
 
 def test_bind_calls_prefers_the_nearer_of_two_runs() -> None:

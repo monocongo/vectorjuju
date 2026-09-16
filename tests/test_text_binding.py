@@ -20,17 +20,18 @@ import pytest
 from PIL import Image
 
 from vectorjuju.synthetic_plat import PAGE_H, RENDER_DPI, generate_sheet
-from vectorjuju.text import BoundCall, TextItem, _page_items, bind_calls, extract_text, normalize_ocr
+from vectorjuju.text import BoundCall, TextItem, bind_calls, extract_text, normalize_ocr, page_items
 from vectorjuju.tracing import Run, trace_runs
 
 pytestmark = pytest.mark.acceptance
 
 
 def test_page_items_converts_docling_bottom_left_boxes_to_top_left_px() -> None:
-    """Every other assertion in this file binds through crop-pass items,
-    whose box_px is the run's own bbox, not `_page_items()`'s docling
-    bottom-left -> package top-left conversion -- so a flip bug there would
-    go uncaught. Pin it directly with text at a known pixel position."""
+    """`page_items()` and the crop pass share `_doc_items()`'s docling
+    bottom-left -> package top-left conversion, but the crop pass then maps
+    its box back through a band-local affine transform, which could mask a
+    flip bug in the shared conversion itself. Pin that conversion directly
+    with page-pass text at a known pixel position."""
     from PIL import ImageDraw, ImageFont
 
     width, height = 600, 800
@@ -40,7 +41,7 @@ def test_page_items_converts_docling_bottom_left_boxes_to_top_left_px() -> None:
     draw.text((50, 150), "TOP", fill="black", font=font)
     draw.text((50, 600), "BOTTOM", fill="black", font=font)
 
-    items = {item.text.strip().upper(): item for item in _page_items(image)}
+    items = {item.text.strip().upper(): item for item in page_items(image)}
 
     assert "TOP" in items
     assert "BOTTOM" in items
@@ -74,8 +75,18 @@ def bound_and_unbound(tmp_path_factory: pytest.TempPathFactory) -> tuple[list[Bo
     out = tmp_path_factory.mktemp("plat")
     truth = generate_sheet(out)
     image = Image.open(Path(out) / "sheet.tif")
+    # One page pass, reused below for extraction instead of re-run (text.py's
+    # module docstring). Not fed to trace_runs's exclude_mask here: this
+    # fixture's labels are rotated to align with -- and nearly span -- their
+    # own boundary edge (issue #8), so a page-level (non-deskewed) OCR box
+    # for one is an axis-aligned bound on a diagonal run of glyphs, wide and
+    # tall enough to blank most of the edge it sits beside. That masking
+    # path needs its own fix (oversized exclusion regions for rotated text,
+    # not something introduced here); tracked separately rather than folded
+    # into this pass.
+    page = page_items(image)
     runs = trace_runs(image, RENDER_DPI)
-    items = extract_text(image, runs, dpi=RENDER_DPI)
+    items = extract_text(image, runs, dpi=RENDER_DPI, page_items=page)
     bound, unbound = bind_calls(runs, items, dpi=RENDER_DPI)
     return bound, unbound, truth
 
