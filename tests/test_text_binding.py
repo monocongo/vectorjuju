@@ -1,10 +1,14 @@
-"""A2 and A3 at the run level, on the synthetic plat fixture.
+"""A2 and A3 at the run level, plus A4's binding half, on the synthetic plat
+fixture.
 
-The full acceptance suite reads A2/A3 off a JSON sidecar; until `convert()`
+The full acceptance suite reads these off a JSON sidecar; until `convert()`
 writes one (issue #22), the same properties are asserted over `BoundCall`'s
 own run and parsed-call fields -- the pattern test_tracing_plat.py set for
-A7. This is the OCR path (real docling, real crops), so it is marked
-``acceptance`` and stays local until #22 stands up the CI acceptance job.
+A7. Curve-ref binding (`test_each_planted_curve_ref_binds_exactly_once`) is
+A4's assertion, not A2/A3's -- covered here early since it needs no fitted
+arc, only a run to bind to. This is the OCR path (real docling, real crops),
+so it is marked ``acceptance`` and stays local until #22 stands up the CI
+acceptance job.
 """
 
 from __future__ import annotations
@@ -16,10 +20,35 @@ import pytest
 from PIL import Image
 
 from vectorjuju.synthetic_plat import PAGE_H, RENDER_DPI, generate_sheet
-from vectorjuju.text import BoundCall, TextItem, bind_calls, extract_text, normalize_ocr
+from vectorjuju.text import BoundCall, TextItem, _page_items, bind_calls, extract_text, normalize_ocr
 from vectorjuju.tracing import Run, trace_runs
 
 pytestmark = pytest.mark.acceptance
+
+
+def test_page_items_converts_docling_bottom_left_boxes_to_top_left_px() -> None:
+    """Every other assertion in this file binds through crop-pass items,
+    whose box_px is the run's own bbox, not `_page_items()`'s docling
+    bottom-left -> package top-left conversion -- so a flip bug there would
+    go uncaught. Pin it directly with text at a known pixel position."""
+    from PIL import ImageDraw, ImageFont
+
+    width, height = 600, 800
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=40)
+    draw.text((50, 150), "TOP", fill="black", font=font)
+    draw.text((50, 600), "BOTTOM", fill="black", font=font)
+
+    items = {item.text.strip().upper(): item for item in _page_items(image)}
+
+    assert "TOP" in items
+    assert "BOTTOM" in items
+    top_box, bottom_box = items["TOP"].box_px, items["BOTTOM"].box_px
+    for box in (top_box, bottom_box):
+        assert box[1] < box[3]  # y0 < y1: top-left origin, y down
+    assert top_box[1] < height / 2  # drawn near the top -> small y
+    assert bottom_box[1] > height / 2  # drawn near the bottom -> large y
 
 
 def to_px(point: list[float]) -> np.ndarray:

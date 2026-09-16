@@ -143,7 +143,7 @@ tests/test_convert_acceptance.py      A1–A11, OCR, pytest.mark.acceptance
 tests/acceptance_helpers.py           pt<->px<->cad, label classify, segment/arc comparison, write_overlay()
 tests/test_tracing.py                 U3 straight half, on rasters drawn in the test
 tests/test_tracing_plat.py            A7 at run level, over the generated sheet
-tests/test_text_binding.py            A2/A3 at run level, OCR, pytest.mark.acceptance
+tests/test_text_binding.py            A2/A3 at run level (curve refs: A4's binding half), OCR, pytest.mark.acceptance
 ```
 
 Split rule: assertable against planted geometry or a pure function → unit.

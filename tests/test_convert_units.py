@@ -223,8 +223,45 @@ def test_parse_call_accepts_a_whole_degree_bearing_with_no_minutes() -> None:
     assert math.isclose(call.distance_ft, 100.0)
 
 
+def test_parse_call_accepts_minutes_with_no_seconds() -> None:
+    call = parse_call("N 45°30' E 100.00'")
+    assert call is not None
+    assert math.isclose(call.bearing_deg, 45.5, abs_tol=1e-9)
+
+
+def test_parse_call_reads_the_south_east_quadrant() -> None:
+    # none of the fixture's planted edges land in SE; the quadrant math is
+    # otherwise untested for this branch of _azimuth.
+    call = parse_call("S 30°00'00\" E 50.00'")
+    assert call is not None
+    assert math.isclose(call.bearing_deg, 150.0, abs_tol=1e-9)  # 180 - 30
+
+
 def test_parse_call_rejects_out_of_range_degrees() -> None:
     assert parse_call("N 999°99' E 100.00'") is None
+
+
+def test_parse_call_accepts_exactly_ninety_degrees() -> None:
+    call = parse_call("N 90°00'00\" E 10.00'")
+    assert call is not None
+    assert math.isclose(call.bearing_deg, 90.0, abs_tol=1e-9)
+
+
+def test_parse_call_rejects_ninety_degrees_plus_any_minutes() -> None:
+    # each field validates in range on its own (0-90, 0-59, 0-59), but a
+    # quadrant bearing tops out at exactly 90 degrees combined.
+    assert parse_call("N 90°30'00\" E 10.00'") is None
+
+
+def test_parse_call_rejects_a_bearing_with_no_distance() -> None:
+    assert parse_call("N 45° E") is None
+
+
+def test_parse_call_rejects_a_distance_not_immediately_after_the_bearing() -> None:
+    # the historic \b-based bug let a distance regex skip past a glued/
+    # garbled read and match a stray digit further into the string --
+    # confirmed here as the "1" in a neighbouring curve ref.
+    assert parse_call("N 45° E 100.00'C1") is None
 
 
 @pytest.mark.parametrize(
@@ -233,12 +270,28 @@ def test_parse_call_rejects_out_of_range_degrees() -> None:
         ('N 87°42\'34" E  200.16"', "foot-mark"),  # foot mark misread as inch mark
         ("N 87°42'34\" E  200.16*", "foot-mark"),  # foot mark dropped to a stray asterisk
         ("N 87 42'34\" E  200.16'", "degree-mark"),  # degree mark dropped
+        ("N 87°42 34\" E  200.16'", "minute-mark"),  # minute mark dropped
+        ("N 87°42'34 E  200.16'", "second-mark"),  # second mark dropped
     ],
 )
 def test_parse_call_flags_a_corrupted_mark_as_suspect(raw: str, suspect: str) -> None:
     call = parse_call(raw)
     assert call is not None
     assert suspect in call.suspect_tokens
+
+
+@pytest.mark.parametrize("raw", ["C1", " C1 ", "c1\n"])
+def test_curve_ref_regex_tolerates_only_whitespace_padding(raw: str) -> None:
+    call = parse_call(raw)
+    assert call is not None
+    assert call.curve_id == "C1"
+
+
+@pytest.mark.parametrize("raw", ["SEE C1", "C1 REF", "C1A"])
+def test_curve_ref_regex_rejects_embedded_non_whitespace_content(raw: str) -> None:
+    # fullmatch, deliberately: a ref merged with adjacent OCR text fails safe
+    # into unbound_text rather than guessing which part is the real one.
+    assert parse_call(raw) is None
 
 
 def test_normalize_ocr_folds_punctuation_confusables_before_case_folding() -> None:
@@ -287,6 +340,45 @@ def test_bind_calls_binds_each_run_at_most_once() -> None:
     assert len(bound) == 1
     assert bound[0].item is first  # closer of the two (distance 2 px vs 6 px)
     assert unbound == [second]
+
+
+def test_bind_calls_optimises_globally_instead_of_claiming_greedily() -> None:
+    """Two runs, two items, crossing distances: A's only candidate is run1
+    (10px); B is nearer to run1 (2px) but also has a real run2 option
+    (50px). Greedy-by-nearest-distance claims run1 for B first and strands
+    A (its only candidate already taken) -- the exact failure docs/prior-art/
+    20-implementation-plan.md's "assignment, not greedy" requirement names.
+    Minimising total distance instead finds A->run1, B->run2 (cost 60,
+    versus greedy's B->run1 + A unbound), binding both.
+    """
+    run1 = _run([(0.0, 0.0), (100.0, 0.0)])
+    run2 = _run([(150.0, 0.0), (150.0, 100.0)])
+    item_a = TextItem(text="N 90°00'00\" E  10.00'", box_px=(48.0, 8.0, 52.0, 12.0), source="page")  # centre (50,10)
+    item_b = TextItem(text="N 90°00'00\" E  10.00'", box_px=(98.0, 0.0, 102.0, 4.0), source="page")  # centre (100,2)
+
+    bound, unbound = bind_calls([run1, run2], [item_a, item_b])
+
+    assert unbound == []
+    by_item = {b.item: b.run for b in bound}
+    assert by_item[item_a] is run1
+    assert by_item[item_b] is run2
+
+
+def test_bind_calls_leaves_a_loser_unbound_not_force_bound_elsewhere() -> None:
+    """Three items competing for two runs: the loser has no other in-gate
+    run and must come back unbound, never pushed onto a farther one."""
+    run1 = _run([(0.0, 0.0), (100.0, 0.0)])
+    run2 = _run([(150.0, 0.0), (150.0, 100.0)])
+    item_a = TextItem(text="N 90°00'00\" E  5.00'", box_px=(48.0, 3.0, 52.0, 7.0), source="page")  # run1 @ 5, only
+    item_b = TextItem(text="N 90°00'00\" E  3.00'", box_px=(48.0, 1.0, 52.0, 5.0), source="page")  # run1 @ 3, only
+    item_c = TextItem(text="N 90°00'00\" E  5.00'", box_px=(148.0, 3.0, 152.0, 7.0), source="page")  # run2 @ 5, only
+
+    bound, unbound = bind_calls([run1, run2], [item_a, item_b, item_c])
+
+    by_item = {b.item: b.run for b in bound}
+    assert by_item[item_b] is run1  # nearer of the two run1 candidates
+    assert by_item[item_c] is run2
+    assert unbound == [item_a]  # run1's loser: no other in-gate run existed
 
 
 def test_bind_calls_is_deterministic() -> None:

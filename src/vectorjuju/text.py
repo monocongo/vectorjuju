@@ -25,6 +25,7 @@ from tempfile import TemporaryDirectory
 import cv2
 import numpy as np
 from PIL import Image
+from scipy.optimize import linear_sum_assignment
 
 from vectorjuju.tracing import Run
 
@@ -72,6 +73,11 @@ _BEARING_RE = re.compile(
 # corrupted forms #7/#8 actually measured (foot misread as inch, or dropped
 # to a stray asterisk); anything other than a clean "'" is a suspect token.
 _DISTANCE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(['\"*])?(?=\s|$)")
+# fullmatch, not a tolerant search: a curve ref must be the read's entire
+# text, the same reject-rather-than-guess stance the bearing parser takes on
+# a corrupted mark. A ref merged with adjacent OCR text (a stray monument
+# tag, table-row noise) fails safe into unbound_text rather than guessing
+# which part of the string is the real reference.
 _CURVE_REF_RE = re.compile(r"^C(\d{1,3})$")
 
 
@@ -137,14 +143,24 @@ def parse_call(raw: str) -> ParsedCall | None:
     degrees = int(deg)
     minutes_val = int(minutes) if minutes else 0
     seconds_val = float(seconds) if seconds else 0.0
-    if not (0 <= degrees <= 90 and 0 <= minutes_val < 60 and 0 <= seconds_val < 60):
+    angle = degrees + minutes_val / 60.0 + seconds_val / 3600.0
+    # A quadrant bearing tops out at exactly 90 degrees; validating each
+    # field in isolation (degrees<=90, minutes<60, ...) lets 90deg30' through
+    # even though the combined angle is past the quadrant boundary.
+    if not (0 <= minutes_val < 60 and 0 <= seconds_val < 60 and angle <= 90):
         return None
 
-    distance_match = _DISTANCE_RE.search(text, bearing_match.end())
+    # The distance must immediately follow the bearing (only whitespace
+    # between): .search() would otherwise be free to skip a glued/garbled
+    # distance -- the exact shape docs/prior-art/00-recon.md:229's \b bug
+    # left behind -- and match a stray digit further into the string
+    # instead (e.g. the "1" in a neighbouring "C1").
+    after_bearing = text[bearing_match.end() :]
+    gap = len(after_bearing) - len(after_bearing.lstrip())
+    distance_match = _DISTANCE_RE.match(text, bearing_match.end() + gap)
     if not distance_match:
         return None
 
-    angle = degrees + minutes_val / 60.0 + seconds_val / 3600.0
     suspects = []
     if deg_mark != "°":
         suspects.append("degree-mark")
@@ -275,6 +291,8 @@ def _ocr_band(band: Image.Image) -> str:
 def _crop_item(image: Image.Image, run: Run, dpi: float) -> TextItem | None:
     """OCR a deskewed band along ``run``; ``None`` if nothing on it parses as a call."""
     pts = run.points_px
+    if len(pts) < 2:
+        return None  # trace_runs never emits this, but nothing here should assume it
     x0, y0 = pts[0]
     x1, y1 = pts[-1]
     length = math.hypot(x1 - x0, y1 - y0)
@@ -285,12 +303,15 @@ def _crop_item(image: Image.Image, run: Run, dpi: float) -> TextItem | None:
     # synthetic fixture's label placement; an off-centre real-plat label
     # needs a locator pass to recentre the band, not just a wider one.
     half_len = max(length * 0.4, _scaled(20.0, dpi))
-    # A curve-ref label sits at the arc's bulge, not on the chord: measured
-    # on the fixture's own C2 (radius 240ft over a 137ft chord), the offset
-    # from the run's own endpoint-to-endpoint chord reaches ~51px @200dpi --
-    # sagitta plus the label's own draw offset and text height. 70px covers
-    # that with headroom for a straight call's much smaller offset too.
-    half_h = _scaled(70.0, dpi)
+    # ponytail: a curve-ref label sits at the arc's bulge, not on the chord,
+    # so its offset from the run's own endpoint-to-endpoint chord grows with
+    # the curve's sagitta -- unboundedly as radius approaches chord/2. 110px
+    # covers the fixture's own C2 (radius 240ft/chord 137ft, offset ~51px)
+    # with headroom down to roughly a 100ft-radius curve on a similar chord;
+    # a materially tighter curve on a long chord can still clip. Once curve
+    # classification lands (issue #18), size this from the run's actual
+    # fitted geometry instead of a flat constant.
+    half_h = _scaled(110.0, dpi)
     band = warp_band(image, (float(x0), float(y0), float(x1), float(y1)), center, half_len, half_h)
 
     text = _ocr_band(band)
@@ -338,7 +359,12 @@ def extract_text(image: Image.Image, runs: Sequence[Run], *, dpi: float = 200.0)
 
 
 def _point_run_distance(point: tuple[float, float], run: Run) -> float:
-    """Min distance from ``point`` to any segment of ``run``'s polyline."""
+    """Min distance from ``point`` to any segment of ``run``'s polyline.
+
+    ``run.points_px`` needs at least 2 points to have a segment at all --
+    every ``Run`` `trace_runs` emits does. A shorter run returns
+    ``math.inf``, which safely excludes it from binding rather than raising.
+    """
     px, py = point
     best = math.inf
     pts = run.points_px
@@ -354,39 +380,47 @@ def _point_run_distance(point: tuple[float, float], run: Run) -> float:
 def bind_calls(
     runs: Sequence[Run], items: Sequence[TextItem], *, dpi: float = 200.0
 ) -> tuple[list[BoundCall], list[TextItem]]:
-    """Bind each parsed call to its nearest run within the gate radius.
-
-    One call per run, one run per call: candidates are sorted by distance and
-    assigned greedily by that order, so a run already claimed by a closer
-    call cannot also take a farther one. Cheap at this scale (tens of runs
-    and items); a real k-d tree is the upgrade docs/prior-art/
-    20-implementation-plan.md names for a denser sheet.
+    """Bind each parsed call to a run within the gate radius, minimising total
+    bind distance over the whole sheet at once -- not nearest-first greedy,
+    which lets one call steal a run a farther call needed more (docs/
+    prior-art/20-implementation-plan.md's "assignment, not greedy" binding
+    requirement). One call per run, one run per call.
 
     Everything that fails to parse as a call, or has no run within the gate,
     comes back in the second list -- never force-bound.
     """
     gate = _scaled(_BIND_RADIUS_PX, dpi)
-    candidates: list[tuple[float, int, int, ParsedCall]] = []
-    for item_index, item in enumerate(items):
-        call = parse_call(item.text)
-        if call is None:
-            continue
-        center = _center(item.box_px)
-        for run_index, run in enumerate(runs):
-            distance = _point_run_distance(center, run)
-            if distance <= gate:
-                candidates.append((distance, run_index, item_index, call))
-    candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+    callable_items = [(index, call) for index, item in enumerate(items) if (call := parse_call(item.text))]
+    if not callable_items or not runs:
+        return [], list(items)
 
-    claimed_runs: set[int] = set()
-    claimed_items: set[int] = set()
+    distances = np.array(
+        [
+            [_point_run_distance(_center(items[item_index].box_px), run) for run in runs]
+            for item_index, _ in callable_items
+        ]
+    )
+    # Any in-gate assignment must always beat any out-of-gate one, so the
+    # solver never prefers a far run over a near one just to keep every row
+    # filled -- it only reaches for a penalty cell when an item has nothing
+    # better left, and that assignment is then dropped by the gate check below.
+    finite = distances[np.isfinite(distances)]
+    penalty = (float(finite.max()) if finite.size else 0.0) + gate * 2.0 + 1.0
+    cost = np.where(distances <= gate, distances, penalty)
+    row_index, col_index = linear_sum_assignment(cost)
+
     bound: list[BoundCall] = []
-    for distance, run_index, item_index, call in candidates:
-        if run_index in claimed_runs or item_index in claimed_items:
-            continue
-        claimed_runs.add(run_index)
-        claimed_items.add(item_index)
-        bound.append(BoundCall(call=call, run=runs[run_index], item=items[item_index], distance_px=distance))
+    bound_item_indices: set[int] = set()
+    for row, col in zip(row_index, col_index, strict=True):
+        distance = float(distances[row, col])
+        if distance > gate:
+            continue  # every candidate run for this item was out of gate
+        item_index, call = callable_items[row]
+        bound.append(BoundCall(call=call, run=runs[col], item=items[item_index], distance_px=distance))
+        bound_item_indices.add(item_index)
 
-    unbound = [item for index, item in enumerate(items) if index not in claimed_items]
+    # row_index is sorted ascending (scipy guarantees this), and rows follow
+    # callable_items' -- hence items' -- own order, so this needs no extra
+    # sort to stay deterministic (A8).
+    unbound = [item for index, item in enumerate(items) if index not in bound_item_indices]
     return bound, unbound

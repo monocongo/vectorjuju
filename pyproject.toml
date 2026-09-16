@@ -16,6 +16,7 @@ dependencies = [
     "pillow>=12.3.0",
     "pypdfium2>=5.13.0",
     "scikit-image>=0.26.0",
+    "scipy>=1.14",
 ]
 
 [dependency-groups]
@@ -24,6 +25,14 @@ dev = [
     "reportlab>=5.0.1",
     "ruff>=0.8,<1",
 ]
+
+[tool.uv]
+# rapidocr (docling's Linux OCR engine) depends on plain opencv-python, which
+# installs into the same cv2 namespace as opencv-python-headless above --
+# an unsupported coexistence one version bump from `ImportError: libGL.so.1`
+# on a headless CI image. Never satisfy it; opencv-python-headless already
+# covers every cv2 need this package has.
+override-dependencies = ["opencv-python; sys_platform == 'never_matches_a_real_platform'"]
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
@@ -42,4 +51,5 @@ target-version = "py312"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--strict-markers"
 markers = ["acceptance: OCR path over a generated medium; local only until the CI acceptance job (issue #22)"]
