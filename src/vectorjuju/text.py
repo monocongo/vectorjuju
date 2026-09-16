@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+import sys
 import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -255,13 +256,18 @@ def _center(box: tuple[float, float, float, float]) -> tuple[float, float]:
 @lru_cache(maxsize=1)
 def _converter():
     from docling.datamodel.base_models import InputFormat
-    from docling.datamodel.pipeline_options import OcrAutoOptions, PdfPipelineOptions
+    from docling.datamodel.pipeline_options import OcrMacOptions, PdfPipelineOptions, RapidOcrOptions
     from docling.document_converter import DocumentConverter, ImageFormatOption
 
-    # scale=1.0: OCR inputs are already pre-scaled by _ocr_image, so docling
-    # must not resample them a second time; it still resolves the engine the
-    # same way (ocrmac on macOS, RapidOCR elsewhere).
-    options = PdfPipelineOptions(ocr_options=OcrAutoOptions(scale=1.0))
+    # The platform's engine, pinned the same way pyproject's extras pick it
+    # (ocrmac on macOS, RapidOCR elsewhere), and scale=1.0 because OCR inputs
+    # are pre-scaled by _ocr_image. OcrAutoOptions does not carry the scale
+    # through to the engine it resolves: docling then resamples the image a
+    # second time, which is both a needless blur and -- on a large scanned
+    # sheet, where the whole page is one bitmap region -- a decompression-bomb
+    # failure.
+    engine = OcrMacOptions if sys.platform == "darwin" else RapidOcrOptions
+    options = PdfPipelineOptions(ocr_options=engine(scale=1.0))
     return DocumentConverter(format_options={InputFormat.IMAGE: ImageFormatOption(pipeline_options=options)})
 
 
