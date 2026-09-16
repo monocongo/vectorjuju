@@ -10,15 +10,15 @@ table never traces as geometry.
 
 from __future__ import annotations
 
-import math
 from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
 import pytest
+from acceptance_helpers import arc_midpoint
 from PIL import Image
 
-from vectorjuju.curves import CircleFit, classify
+from vectorjuju.curves import classify
 from vectorjuju.synthetic_plat import PAGE_H, RENDER_DPI, SCALE_PT_PER_FT, generate_sheet
 from vectorjuju.tracing import Run, trace_runs
 
@@ -77,21 +77,6 @@ def endpoint_reach(points: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
     return float(min(forward, backward))
 
 
-def arc_midpoint(points: np.ndarray, fit: CircleFit) -> np.ndarray:
-    """Point halfway along the fitted sweep from the run's start to its end."""
-    centre = np.asarray(fit.center_px)
-    start = math.atan2(points[0][1] - centre[1], points[0][0] - centre[0])
-    end = math.atan2(points[-1][1] - centre[1], points[-1][0] - centre[0])
-    if fit.clockwise:  # increasing raster angle turns clockwise on the page
-        while end <= start:
-            end += 2 * math.pi
-    else:
-        while end >= start:
-            end -= 2 * math.pi
-    angle = (start + end) / 2
-    return centre + fit.radius_px * np.array([math.cos(angle), math.sin(angle)])
-
-
 def test_exactly_one_run_per_straight_edge(plat: tuple[list[Run], dict]):
     runs, truth = plat
     straight = [segment for segment in truth["segments"] if segment["kind"] == "straight"]
@@ -144,15 +129,17 @@ def test_planted_arcs_classify_as_circles(plat: tuple[list[Run], dict]):
     anchors = {label["segment_id"]: label["anchor_pt"] for label in truth["labels"] if label["kind"] == "curve_ref"}
     matched = []
     for segment in (segment for segment in truth["segments"] if segment["kind"] == "curve"):
-        a, b = to_px(segment["start_pt"]), to_px(segment["end_pt"])
-        hits = [(index, fit) for index, fit in curves if endpoint_reach(runs[index].points_px, a, b) <= 8.0]
-        assert len(hits) == 1, f"{segment['id']}: {len(hits)} curve runs reach it"
+        radius_px = radii_ft[segment["curve_id"]] * SCALE_PT_PER_FT * RENDER_DPI / 72.0
+        # Match on the fitted radius, not endpoint proximity: the radius is
+        # distinctive while the traced ends sit inside the corner-splitting slop.
+        hits = [(index, fit) for index, fit in curves if abs(fit.radius_px - radius_px) / radius_px <= 0.03]
+        assert len(hits) == 1, f"{segment['id']}: {len(hits)} curve runs fit its radius"
         index, fit = hits[0]
         assert fit is not None
         matched.append(index)
 
-        radius_px = radii_ft[segment["curve_id"]] * SCALE_PT_PER_FT * RENDER_DPI / 72.0
-        assert abs(fit.radius_px - radius_px) / radius_px <= 0.03, segment["id"]
+        a, b = to_px(segment["start_pt"]), to_px(segment["end_pt"])
+        assert endpoint_reach(runs[index].points_px, a, b) <= 8.0, segment["id"]
         for end in (runs[index].points_px[0], runs[index].points_px[-1]):
             centre = np.asarray(fit.center_px)
             assert abs(float(np.hypot(*(end - centre))) - fit.radius_px) <= 4.0

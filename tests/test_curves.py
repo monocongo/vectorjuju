@@ -7,10 +7,9 @@ fixture drift; the synthetic plat's planted arcs are classified in
 
 from __future__ import annotations
 
-import math
-
 import numpy as np
 import pytest
+from acceptance_helpers import arc_midpoint
 from PIL import Image, ImageDraw
 
 from vectorjuju.curves import CircleFit, classify
@@ -73,18 +72,7 @@ def test_clockwise_and_midpoint_agree_with_the_planted_bulge():
     assert kind == "curve"
     assert fit is not None
 
-    centre = np.asarray(fit.center_px)
-    start = math.atan2(points[0][1] - centre[1], points[0][0] - centre[0])
-    end = math.atan2(points[-1][1] - centre[1], points[-1][0] - centre[0])
-    if fit.clockwise:
-        while end <= start:
-            end += 2 * math.pi
-    else:
-        while end >= start:
-            end -= 2 * math.pi
-    midpoint = centre + fit.radius_px * np.array([math.cos((start + end) / 2), math.sin((start + end) / 2)])
-
-    assert np.hypot(*(midpoint - planted[len(planted) // 2])) <= 2.0
+    assert np.hypot(*(arc_midpoint(points, fit) - planted[len(planted) // 2])) <= 2.0
 
 
 def test_l_corner_runs_classify_as_lines():
@@ -130,14 +118,38 @@ def test_bent_run_that_is_not_a_circle_falls_back_to_spline():
     assert fit is None  # the writer emits the SPLINE fallback
 
 
-@pytest.mark.parametrize("dpi", [100.0, 200.0, 400.0])
+def test_three_point_bend_falls_back_to_spline():
+    # Every three non-collinear points lie on a circle exactly, so a 3-point
+    # run has no residual evidence; it goes to the SPLINE fallback instead of
+    # a fabricated ARC centre.
+    bend = np.array([[60.0, 240.0], [60.0, 60.0], [240.0, 60.0]])
+
+    assert classify(bend, DPI) == ("curve", None)
+
+
+@pytest.mark.parametrize("dpi", [200.0, 400.0])
 def test_arc_classification_is_dpi_invariant(dpi: float):
-    points = CENTRE + (_arc() - CENTRE) * (dpi / DPI)
+    scale = dpi / DPI
+    image = Image.new("L", (round(900 * scale), round(900 * scale)), 255)
+    planted = _arc() * scale
+    ImageDraw.Draw(image).line([tuple(point) for point in planted], fill=0, width=round(5 * scale), joint="curve")
 
-    kind, fit = classify(points, dpi)
+    runs = trace_runs(image, dpi)
 
+    assert len(runs) == 1
+    kind, fit = classify(runs[0].points_px, dpi)
     assert kind == "curve"
     assert fit is not None
+
+
+def test_bow_gate_scales_with_dpi():
+    # 1 px of sagitta over a 200 px chord: under the 1.5 px reference bow at
+    # 200 dpi, over the 0.75 px gate at 100 dpi -- the gate follows the
+    # working resolution the way tracing's simplification tolerance does.
+    bend = np.array([[0.0, 0.0], [100.0, 1.0], [200.0, 0.0]])
+
+    assert classify(bend, DPI) == ("line", None)
+    assert classify(bend, DPI / 2)[0] == "curve"
 
 
 @pytest.mark.parametrize("dpi", [0, -1, float("nan"), float("inf")])
