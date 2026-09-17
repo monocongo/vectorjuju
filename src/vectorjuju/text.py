@@ -288,11 +288,12 @@ def _convert_path(path: Path):
 # (RapidOCR dropped a decimal point or a digit on Linux; ocrmac's reads are
 # stable but lossy), and at 2x RapidOCR still misses the short curve-ref
 # labels. Handing the engines a LANCZOS 3x pre-scale instead of docling's own
-# default 3.0x resample keeps the reads correct on both, and pixel-wise it is
-# no more than the default it replaces. Capped so a large sheet cannot blow
-# up the OCR buffer; a page already over the cap is scaled less.
+# default 3.0x resample keeps the reads correct on both. The cap is what
+# bounds our own buffer: just under Pillow's decompression-bomb ceiling,
+# which is the failure a larger input produces. A 24x18 in sheet at 200 dpi
+# (17 MP) still lands at 3x under it; only a bigger page is scaled less.
 _OCR_UPSCALE = 3.0
-_OCR_MAX_PIXELS = 40_000_000
+_OCR_MAX_PIXELS = 160_000_000
 
 
 def _ocr_image(image: Image.Image) -> tuple[Image.Image, float]:
