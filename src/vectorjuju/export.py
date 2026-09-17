@@ -91,6 +91,8 @@ def write_outputs(
     if not math.isfinite(dpi) or dpi <= 0:
         raise ValueError(f"write_outputs requires a finite dpi > 0, got {dpi!r}")
     labels = {call.run: call for call in bound}
+    if len(labels) != len(bound) or not set(labels) <= set(runs):
+        raise ValueError("every bound call needs its own run in runs: one label per run, runs by identity")
     # Unique staged names: two conversions targeting the same output never
     # overwrite or delete each other's staging files.
     token = f"{os.getpid()}.{uuid4().hex}"
@@ -156,7 +158,7 @@ def write_outputs(
                 staged_sidecar.replace(sidecar_path)
                 try:
                     staged_dxf.replace(out)
-                except OSError:
+                except BaseException:  # OSError, or an interrupt between the two renames
                     if previous_sidecar is None:
                         sidecar_path.unlink(missing_ok=True)
                     else:
