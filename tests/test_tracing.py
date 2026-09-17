@@ -231,6 +231,24 @@ def test_corner_closure_rejects_an_unrelated_stroke_passing_near_an_end():
     assert closed[0].points_px[-1] == pytest.approx((110.0, 0.0))
 
 
+def test_a_cycle_keeps_its_closure_when_a_neighbour_terminates_near_the_junction():
+    # A cycle's first and last point are one junction, but their outward rays
+    # point opposite ways, so a neighbour crossing one ray and not the other
+    # split that junction in two -- and the writer then read the loop as an
+    # open run (a degenerate ARC, or a polyline with a gap). A cycle has no
+    # free end to close, so its own closure has to survive the pass.
+    angles = np.linspace(0.0, 2.0 * np.pi, 41)
+    ring = np.column_stack([200.0 + 60.0 * np.cos(angles), 200.0 + 60.0 * np.sin(angles)])
+    ring[-1] = ring[0]
+    loop = Run(points_px=ring)
+    stub = Run(points_px=np.array([[270.0, 195.0], [300.0, 210.0]]))  # terminates past the junction
+
+    closed = join_corners([loop, stub])
+
+    assert np.array_equal(closed[0].points_px, loop.points_px)
+    assert np.array_equal(closed[0].points_px[0], closed[0].points_px[-1])
+
+
 def test_corner_index_growth_follows_the_segment_not_its_bounding_box():
     # A long diagonal run must index the cells it crosses, not every cell of
     # its 313x313-cell bounding box (the quadratic-memory blow-up).

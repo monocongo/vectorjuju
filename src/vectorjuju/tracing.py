@@ -161,6 +161,13 @@ def _closed_run(
     neighbours it is later closed against.
     """
     points = run.points_px
+    if len(points) > 2 and np.array_equal(points[0], points[-1]):
+        # A cycle's two ends are one junction, and their outward rays point
+        # opposite ways: extending each onto a neighbour's centreline splits
+        # that junction into two points, and the writer then emits the loop as
+        # an open run -- a degenerate ARC, or a polyline with a gap. Its length
+        # is already corner to corner, so calibration loses nothing.
+        return run
     moved = points.copy()
     ends: list[int] = []
     for at_start in (True, False):
@@ -193,7 +200,9 @@ def _seat_curve_ends(points: np.ndarray, moved: np.ndarray, ends: list[int], dpi
     centre = np.asarray(fit.center_px)
     for end in ends:
         vector = moved[end] - centre
-        moved[end] = centre + vector * (fit.radius_px / float(np.hypot(*vector)))
+        norm = float(np.hypot(*vector))
+        if norm:  # a corner landing exactly on the centre has no radial direction to project along
+            moved[end] = centre + vector * (fit.radius_px / norm)
     return moved
 
 
