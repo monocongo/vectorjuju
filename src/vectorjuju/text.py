@@ -355,13 +355,15 @@ def page_items(image: Image.Image) -> list[TextItem]:
     instead of once per call.
     """
     ocr, factor = _ocr_image(image)
+    height = ocr.size[1]
     with TemporaryDirectory() as tmp:
         path = Path(tmp) / "page.png"
         ocr.save(path, format="PNG")
+        del ocr  # the upscaled buffer is dead once saved; docling decodes its own copy
         doc = _convert_path(path)
     if doc is None:
         return []
-    return _doc_items(doc, ocr.size[1], "page", factor)
+    return _doc_items(doc, height, "page", factor)
 
 
 _page_items = page_items  # internal alias: extract_text's page_items kwarg shadows the module-level name
@@ -405,13 +407,15 @@ def warp_band(
 def _ocr_band(band: Image.Image) -> list[TextItem]:
     """OCR one band into one TextItem per region, boxes in the band's pixels."""
     ocr, factor = _ocr_image(band)
+    height = ocr.size[1]
     with TemporaryDirectory() as tmp:
         path = Path(tmp) / "band.png"
         ocr.save(path, format="PNG")
+        del ocr  # the upscaled buffer is dead once saved; docling decodes its own copy
         doc = _convert_path(path)
     if doc is None:
         return []
-    return _doc_items(doc, ocr.size[1], "crop", factor)
+    return _doc_items(doc, height, "crop", factor)
 
 
 def _band_call(items: Sequence[TextItem]) -> tuple[str, tuple[float, float, float, float]] | None:
