@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -361,6 +362,30 @@ def test_a_failed_sidecar_publication_leaves_the_previous_pair_intact(tmp_path):
         write_outputs(tmp_path / "sheet.dxf", runs, bound, unbound, scale=SCALE, img_height=IMG_HEIGHT)
 
     assert out.read_bytes() == dxf_before  # the drawing is not republished on its own
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == ["sheet.dxf", "sheet.json"]
+
+
+def test_a_failed_dxf_publication_restores_the_previous_sidecar(tmp_path, monkeypatch):
+    """Major: the sidecar is published first, so a DXF rename that fails must
+    put the previous sidecar back -- never leave new metadata beside the old
+    drawing."""
+    out = _write(tmp_path, [], [], [])[0]
+    dxf_before = out.read_bytes()
+    sidecar_before = out.with_suffix(".json").read_bytes()
+
+    real_replace = os.replace
+
+    def fail_publishing_the_dxf(src, dst):
+        if Path(dst) == out:
+            raise OSError("dxf rename refused")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", fail_publishing_the_dxf)
+    with pytest.raises(OSError, match="dxf rename refused"):
+        write_outputs(out, [_line_run()], [], [], scale=SCALE, img_height=IMG_HEIGHT)
+
+    assert out.read_bytes() == dxf_before
+    assert out.with_suffix(".json").read_bytes() == sidecar_before
     assert sorted(entry.name for entry in tmp_path.iterdir()) == ["sheet.dxf", "sheet.json"]
 
 

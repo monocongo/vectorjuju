@@ -96,15 +96,36 @@ def _alnum(text: str) -> str:
     return re.sub(r"[^0-9A-Z]", "", text)
 
 
+def _mark_places(text: str) -> list[tuple[int, str]]:
+    """Each mark with the alphanumerics before it: its place in the text, so a
+    mark read against the wrong number cannot hide behind an equal count."""
+    places: list[tuple[int, str]] = []
+    alnum = 0
+    for char in text:
+        if char in _MARKS:
+            places.append((alnum, char))
+        elif char.isalnum():
+            alnum += 1
+    return places
+
+
+def _marks_in_place(got: str, want: str) -> bool:
+    """Every mark got is read where want has it: marks may be lost, but never
+    invented, duplicated, or swapped between numbers."""
+    remaining = iter(_mark_places(want))
+    return all(place in remaining for place in _mark_places(got))
+
+
 def label_passes(recovered: str, truth: str) -> bool:
     """The suite's label-fidelity rule, criteria from the issue-13 prototype.
 
     ``exact`` and ``normalized`` pass outright. Otherwise the read must be
     ``text_only`` -- every digit and letter right, decimals right -- *and* gain
-    no unit mark: for each of ``°'\"``, the read may have lost marks but not
-    invented or swapped one. A ``200.16'`` read as ``200.16"`` is 12x out and
-    fails, which is exactly what the bare ``text_only`` verdict would wave
-    through.
+    no unit mark: the read may have lost marks but not invented, duplicated,
+    or moved one, so ``N 12'34°56" E`` for truth ``N 12°34'56" E`` fails on
+    the swapped degree and minute. A ``200.16'`` read as ``200.16"`` is 12x
+    out and fails, which is exactly what the bare ``text_only`` verdict would
+    wave through.
     """
     got, want = normalize_text(recovered), normalize_text(truth)
     if not recovered.strip():
@@ -113,7 +134,7 @@ def label_passes(recovered: str, truth: str) -> bool:
         return True
     if _alnum(got) != _alnum(want) or got.count(".") != want.count("."):
         return False
-    return all(got.count(mark) <= want.count(mark) for mark in _MARKS)
+    return _marks_in_place(got, want)
 
 
 def to_px_points(points: Iterable[Iterable[float]], *, fpp: float, img_height: int) -> np.ndarray:

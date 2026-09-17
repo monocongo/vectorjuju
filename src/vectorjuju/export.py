@@ -70,9 +70,10 @@ def write_outputs(
     Both artifacts are staged whole and then published sidecar first under an
     exclusive cross-process lock, so a failure writing either one leaves the
     previous pair in place and two conversions to one output cannot publish
-    one run's sidecar beside the other's DXF. POSIX has no two-file
-    transaction above that: a reader between the two renames can still see
-    one run's sidecar beside the previous DXF.
+    one run's sidecar beside the other's DXF. A failed DXF rename restores
+    the previous sidecar, so the two files never disagree about their run.
+    POSIX has no two-file transaction above that: a reader between the two
+    renames can still see one run's sidecar beside the previous DXF.
 
     Both files are byte-identical across runs over the same input: ezdxf
     otherwise stamps a version+timestamp marker at document creation, a
@@ -145,12 +146,23 @@ def write_outputs(
             handle.write("\n")
         # Both renames under one cross-process lock: without it two
         # conversions to the same output can interleave their two renames and
-        # publish a sidecar from one beside a DXF from the other.
+        # publish a sidecar from one beside a DXF from the other. The previous
+        # sidecar is held only across the renames, so a DXF rename that fails
+        # puts it back instead of leaving new metadata beside the old DXF.
         with _publish_lock_path(out).open("a+") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
+            previous_sidecar = sidecar_path.read_bytes() if sidecar_path.is_file() else None
             try:
                 staged_sidecar.replace(sidecar_path)
-                staged_dxf.replace(out)
+                try:
+                    staged_dxf.replace(out)
+                except OSError:
+                    if previous_sidecar is None:
+                        sidecar_path.unlink(missing_ok=True)
+                    else:
+                        staged_sidecar.write_bytes(previous_sidecar)
+                        staged_sidecar.replace(sidecar_path)
+                    raise
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
     finally:
