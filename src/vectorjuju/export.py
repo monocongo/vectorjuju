@@ -16,6 +16,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 import math
 import os
 import tempfile
@@ -44,6 +45,8 @@ _FONT_SIZE_PT = 7.5
 # ezdxf's fixed-metadata switch is process-global, so overlapping writes must
 # not share the interval; whoever holds this holds the switch.
 _META_LOCK = threading.Lock()
+
+_logger = logging.getLogger(__name__)
 
 
 def write_outputs(
@@ -159,11 +162,16 @@ def write_outputs(
                 try:
                     staged_dxf.replace(out)
                 except BaseException:  # OSError, or an interrupt between the two renames
-                    if previous_sidecar is None:
-                        sidecar_path.unlink(missing_ok=True)
-                    else:
-                        staged_sidecar.write_bytes(previous_sidecar)
-                        staged_sidecar.replace(sidecar_path)
+                    try:
+                        if previous_sidecar is None:
+                            sidecar_path.unlink(missing_ok=True)
+                        else:
+                            staged_sidecar.write_bytes(previous_sidecar)
+                            staged_sidecar.replace(sidecar_path)
+                    except OSError:
+                        # A second failure must not replace the first, but it
+                        # leaves the pair torn, so it cannot be silent either.
+                        _logger.warning("sidecar rollback failed for %s", sidecar_path, exc_info=True)
                     raise
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)

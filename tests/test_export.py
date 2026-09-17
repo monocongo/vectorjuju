@@ -389,6 +389,48 @@ def test_a_failed_dxf_publication_restores_the_previous_sidecar(tmp_path, monkey
     assert sorted(entry.name for entry in tmp_path.iterdir()) == ["sheet.dxf", "sheet.json"]
 
 
+def test_an_interrupted_dxf_publication_restores_the_previous_sidecar(tmp_path, monkeypatch):
+    """An interrupt between the two renames is not an OSError, but it must
+    restore the previous sidecar exactly as a failed rename does."""
+    out = _write(tmp_path, [], [], [])[0]
+    sidecar_before = out.with_suffix(".json").read_bytes()
+    real_replace = os.replace
+
+    def interrupt_publishing_the_dxf(src, dst):
+        if Path(dst) == out:
+            raise KeyboardInterrupt
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", interrupt_publishing_the_dxf)
+    with pytest.raises(KeyboardInterrupt):
+        write_outputs(out, [_line_run()], [], [], scale=SCALE, img_height=IMG_HEIGHT)
+
+    assert out.with_suffix(".json").read_bytes() == sidecar_before
+
+
+def test_a_failed_rollback_does_not_replace_the_publish_failure(tmp_path, monkeypatch):
+    """A rollback that cannot restore the pair is best-effort: the exception
+    that caused it must still be the one the caller sees."""
+    out = _write(tmp_path, [], [], [])[0]
+    sidecar_path = out.with_suffix(".json")
+    real_replace = os.replace
+    sidecar_replacements = 0
+
+    def fail_the_dxf_then_the_rollback(src, dst):
+        nonlocal sidecar_replacements
+        if Path(dst) == out:
+            raise OSError("dxf rename refused")
+        if Path(dst) == sidecar_path:
+            sidecar_replacements += 1
+            if sidecar_replacements > 1:  # the rollback that follows the failure above
+                raise OSError("rollback refused")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", fail_the_dxf_then_the_rollback)
+    with pytest.raises(OSError, match="dxf rename refused"):
+        write_outputs(out, [_line_run()], [], [], scale=SCALE, img_height=IMG_HEIGHT)
+
+
 def test_overlapping_writers_do_not_share_the_metadata_window(tmp_path, monkeypatch):
     """Minor: the fixed-metadata switch is process-global. Two overlapping writers
     must serialize, or the second one's restore leaves it set (and the first
