@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import threading
 from pathlib import Path
@@ -408,7 +409,7 @@ def test_an_interrupted_dxf_publication_restores_the_previous_sidecar(tmp_path, 
     assert out.with_suffix(".json").read_bytes() == sidecar_before
 
 
-def test_a_failed_rollback_does_not_replace_the_publish_failure(tmp_path, monkeypatch):
+def test_a_failed_rollback_does_not_replace_the_publish_failure(tmp_path, monkeypatch, caplog):
     """A rollback that cannot restore the pair is best-effort: the exception
     that caused it must still be the one the caller sees."""
     out = _write(tmp_path, [], [], [])[0]
@@ -427,8 +428,10 @@ def test_a_failed_rollback_does_not_replace_the_publish_failure(tmp_path, monkey
         real_replace(src, dst)
 
     monkeypatch.setattr(os, "replace", fail_the_dxf_then_the_rollback)
-    with pytest.raises(OSError, match="dxf rename refused"):
+    with caplog.at_level(logging.WARNING), pytest.raises(OSError, match="dxf rename refused"):
         write_outputs(out, [_line_run()], [], [], scale=SCALE, img_height=IMG_HEIGHT)
+
+    assert any(record.levelno == logging.WARNING for record in caplog.records)  # torn, not silent
 
 
 def test_overlapping_writers_do_not_share_the_metadata_window(tmp_path, monkeypatch):

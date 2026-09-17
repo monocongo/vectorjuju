@@ -168,9 +168,10 @@ def write_outputs(
                         else:
                             staged_sidecar.write_bytes(previous_sidecar)
                             staged_sidecar.replace(sidecar_path)
-                    except OSError:
-                        # A second failure must not replace the first, but it
-                        # leaves the pair torn, so it cannot be silent either.
+                    except BaseException:
+                        # Any second failure -- another interrupt included -- must
+                        # not replace the first, but it leaves the pair torn, so
+                        # it cannot be silent either.
                         _logger.warning("sidecar rollback failed for %s", sidecar_path, exc_info=True)
                     raise
             finally:
