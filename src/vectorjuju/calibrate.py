@@ -36,9 +36,8 @@ import numpy as np
 from vectorjuju.errors import VectorjujuError
 from vectorjuju.pipeline import _require_fpp
 from vectorjuju.text import BoundCall
-from vectorjuju.tracing import _CORNER_CLOSE_PX, Run, _cell_index, _closed_run
+from vectorjuju.tracing import _CORNER_CLOSE_PX, Run, _cell_index, _closed_run, _scaled
 
-_REFERENCE_DPI = 200.0
 # Prior art: RANSAC needs at least three bound distance calls -- a consensus
 # of one or two is not a regression (docs/prior-art/HANDOFF.md, "need >= 3").
 _MIN_SAMPLES = 3
@@ -69,10 +68,6 @@ class Scale:
 
     value: float
     method: Literal["ransac", "override"]
-
-
-def _scaled(px_at_reference_dpi: float, dpi: float) -> float:
-    return px_at_reference_dpi * dpi / _REFERENCE_DPI
 
 
 def _closed_run_length_px(

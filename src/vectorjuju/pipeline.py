@@ -169,6 +169,8 @@ def convert(
 
     if units not in INSUNITS:
         raise ValueError(f"units must be one of {sorted(INSUNITS)}, got {units!r}")
+    if not math.isfinite(dpi) or dpi <= 0:
+        raise ValueError(f"convert requires a finite dpi > 0, got {dpi!r}")
     input = Path(input)
     image = load_raster(input, dpi=dpi)
     # Text is traced through, not masked out: a page-pass OCR box is an
