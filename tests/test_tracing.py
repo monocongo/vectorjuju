@@ -10,7 +10,15 @@ import numpy as np
 import pytest
 from PIL import Image, ImageDraw, ImageFont
 
-from vectorjuju.tracing import _merge_dashes, trace_runs
+from vectorjuju.tracing import (
+    Run,
+    _cell_index,
+    _closest_point,
+    _merge_dashes,
+    _nearby_runs,
+    join_corners,
+    trace_runs,
+)
 
 DPI = 200.0
 
@@ -203,6 +211,36 @@ def test_excluded_ink_does_not_widen_a_surviving_stroke():
     mask[22:30, 30:281] = True
 
     assert trace_runs(image, DPI, exclude_mask=mask) == []
+
+
+def test_corner_closure_rejects_an_unrelated_stroke_passing_near_an_end():
+    # A run ending at (100, 0) with a perpendicular stroke crossing 10 px
+    # beyond it: the stroke does not terminate at this run's corner, so it
+    # must not capture the end into its linework...
+    run = Run(points_px=np.array([[0.0, 0.0], [100.0, 0.0]]))
+    unrelated = Run(points_px=np.array([[110.0, -80.0], [110.0, 80.0]]))
+
+    closed = join_corners([run, unrelated])
+
+    assert closed[0].points_px[-1] == pytest.approx((100.0, 0.0))
+
+    # ...but a stroke that does terminate at the corner still closes it.
+    terminating = Run(points_px=np.array([[110.0, 0.0], [110.0, 80.0]]))
+    closed = join_corners([run, terminating])
+
+    assert closed[0].points_px[-1] == pytest.approx((110.0, 0.0))
+
+
+def test_corner_index_growth_follows_the_segment_not_its_bounding_box():
+    # A long diagonal run must index the cells it crosses, not every cell of
+    # its 313x313-cell bounding box (the quadratic-memory blow-up).
+    run = Run(points_px=np.array([[0.0, 0.0], [10000.0, 10000.0]]))
+
+    index = _cell_index([run], 32.0)
+
+    assert 300 <= len(index) <= 400  # ~one per 32 px of travel, not ~98,000
+    middle = np.array([5000.0, 5000.0])
+    assert any(_closest_point(middle, points)[0] == 0.0 for points in _nearby_runs(index, 32.0, middle, [run], -1))
 
 
 def test_invalid_inputs_are_rejected():

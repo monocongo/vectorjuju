@@ -13,7 +13,7 @@ import pytest
 
 from vectorjuju import tracing
 from vectorjuju.calibrate import Scale, ScaleCalibrationError, _consensus, _ransac_fpp, calibrate_scale
-from vectorjuju.convert import VectorjujuError
+from vectorjuju.pipeline import VectorjujuError
 from vectorjuju.synthetic_plat import (
     CURVE_EDGES,
     PAGE_H,
@@ -157,6 +157,20 @@ def test_corner_closure_does_not_scan_distant_runs(monkeypatch: pytest.MonkeyPat
 
     assert abs(scale.value - 0.25) <= 0.01 * 0.25
     assert not any(points is far.run.points_px for points in scanned)
+
+
+def test_calibration_closes_against_the_population_it_is_given() -> None:
+    """A called edge is measured closed against every run it is closed against
+    when emitted, not a bound-only subset: ``convert()`` passes all traced runs,
+    so an unbound edge that terminates at a called edge's corner counts."""
+    calls = [_bound_call("N 0°00'00\" E  27.50'", [(0.0, y), (100.0, y)]) for y in (0.0, 50.0, 100.0)]
+    neighbours = [Run(points_px=np.array([[110.0, y], [110.0, y + 40.0]])) for y in (0.0, 50.0, 100.0)]
+
+    bound_only = calibrate_scale(calls)
+    measured = calibrate_scale(calls, runs=[*[call.run for call in calls], *neighbours])
+
+    assert abs(measured.value - 0.25) <= 1e-9  # 110 px closed against the 27.50 ft call
+    assert bound_only.value > 1.05 * 0.25  # raw 100 px: the corner is never reached
 
 
 @pytest.mark.parametrize("count", [0, 1, 2])

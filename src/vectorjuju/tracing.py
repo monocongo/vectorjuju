@@ -147,25 +147,31 @@ def join_corners(runs: Sequence[Run], dpi: float = _REFERENCE_DPI) -> list[Run]:
     if len(runs) < 2:
         return list(runs)
     cap = _scaled(_CORNER_CLOSE_PX, dpi)
-    cell = 2 * cap
-    index = _cell_index(runs, cell)
-    joined: list[Run] = []
-    for run_index, run in enumerate(runs):
-        points = run.points_px
-        moved = points.copy()
-        ends: list[int] = []
-        for at_start in (True, False):
-            end = 0 if at_start else -1
-            closed = _closes_end(points, at_start, _nearby_runs(index, cell, points[end], runs, run_index), cap)
-            if not np.array_equal(closed, points[end]):
-                moved[end] = closed
-                ends.append(end)
-        if ends:
-            moved = _seat_curve_ends(points, moved, ends, dpi)
-            joined.append(Run(points_px=moved))
-        else:
-            joined.append(run)
-    return joined
+    index = _cell_index(runs, 2 * cap)
+    return [_closed_run(run, run_index, runs, index, cap, dpi) for run_index, run in enumerate(runs)]
+
+
+def _closed_run(
+    run: Run, run_index: int, runs: Sequence[Run], index: dict[tuple[int, int], list[int]], cap: float, dpi: float
+) -> Run:
+    """One run with each end closed onto its corner.
+
+    The closure measurement (``calibrate_scale``) and the emitted geometry
+    both come through here, so a called edge is measured against exactly the
+    neighbours it is later closed against.
+    """
+    points = run.points_px
+    moved = points.copy()
+    ends: list[int] = []
+    for at_start in (True, False):
+        end = 0 if at_start else -1
+        closed = _closes_end(points, at_start, _nearby_runs(index, 2 * cap, points[end], runs, run_index), cap)
+        if not np.array_equal(closed, points[end]):
+            moved[end] = closed
+            ends.append(end)
+    if ends:
+        moved = _seat_curve_ends(points, moved, ends, dpi)
+    return Run(points_px=moved)
 
 
 def _seat_curve_ends(points: np.ndarray, moved: np.ndarray, ends: list[int], dpi: float) -> np.ndarray:
@@ -212,7 +218,10 @@ def _closes_end(points: np.ndarray, at_start: bool, neighbours: Sequence[np.ndar
 
     Intersects the run's outward end ray with each neighbour's centreline and
     takes the smallest valid crossing; the end is returned unchanged when no
-    neighbour meets it inside the cap.
+    neighbour meets it inside the cap. A neighbour only counts when it also
+    terminates at that corner (one of its own ends is within the cap), so an
+    unrelated stroke passing within reach -- a tie, an adjacent boundary --
+    cannot capture the end into its linework.
     """
     end = points[0] if at_start else points[-1]
     direction = _end_direction(points, at_start)
@@ -229,22 +238,35 @@ def _closes_end(points: np.ndarray, at_start: bool, neighbours: Sequence[np.ndar
             )
         except np.linalg.LinAlgError:  # parallel, already guarded; keep the degenerate safe
             continue
-        if 0.0 < along <= cap and abs(across) <= cap and along < best[0]:
-            best = (float(along), end + along * direction)
+        if not (0.0 < along <= cap and abs(across) <= cap and along < best[0]):
+            continue
+        corner = end + along * direction
+        if float(np.hypot(*(corner - neighbour[0]))) > cap and float(np.hypot(*(corner - neighbour[-1]))) > cap:
+            continue
+        best = (float(along), corner)
     return best[1] if best[1] is not None else end
 
 
 def _cell_index(runs: Sequence[Run], cell_px: float) -> dict[tuple[int, int], list[int]]:
     """Run indices by raster cell, so closure looks up neighbours instead of
-    scanning every other run's polyline at every end."""
+    scanning every other run's polyline at every end.
+
+    Cells are walked along each segment, not filled over its bounding box: a
+    long diagonal run costs the cells it crosses, not its box's area. A run
+    is listed once per contiguous cell run, so its entries track its length.
+    """
     index: dict[tuple[int, int], list[int]] = {}
     for i, run in enumerate(runs):
+        last: tuple[int, int] | None = None
         for a, b in pairwise(run.points_px):
-            x0, x1 = min(float(a[0]), float(b[0])), max(float(a[0]), float(b[0]))
-            y0, y1 = min(float(a[1]), float(b[1])), max(float(a[1]), float(b[1]))
-            for cx in range(int(x0 // cell_px), int(x1 // cell_px) + 1):
-                for cy in range(int(y0 // cell_px), int(y1 // cell_px) + 1):
-                    index.setdefault((cx, cy), []).append(i)
+            dx, dy = float(b[0] - a[0]), float(b[1] - a[1])
+            steps = max(1, math.ceil(max(abs(dx), abs(dy)) / cell_px))
+            for step in range(steps + 1):
+                t = step / steps
+                cell = (int((a[0] + t * dx) // cell_px), int((a[1] + t * dy) // cell_px))
+                if cell != last:
+                    index.setdefault(cell, []).append(i)
+                    last = cell
     return index
 
 

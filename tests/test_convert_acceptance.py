@@ -29,8 +29,8 @@ from conftest import MEDIA, Conversion, SyntheticSheet
 from ezdxf.recover import readfile
 
 from vectorjuju.calibrate import ScaleCalibrationError
-from vectorjuju.convert import UnsupportedInputError, convert, load_raster
 from vectorjuju.export import LAYERS
+from vectorjuju.pipeline import UnsupportedInputError, convert, load_raster
 from vectorjuju.synthetic_plat import RENDER_DPI, SCALE_PT_PER_FT
 
 pytestmark = pytest.mark.acceptance

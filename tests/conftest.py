@@ -19,7 +19,7 @@ from acceptance_helpers import write_overlay
 from PIL import Image
 from reportlab.pdfgen import canvas
 
-from vectorjuju.convert import convert, load_raster
+from vectorjuju.pipeline import convert, load_raster
 from vectorjuju.synthetic_plat import PAGE_H, PAGE_W, RENDER_DPI, generate_sheet
 
 MEDIA = ("pdf", "tif", "jpg")

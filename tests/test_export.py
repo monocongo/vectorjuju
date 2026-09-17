@@ -6,6 +6,7 @@ fixture drift; the acceptance suite re-runs these gates over traced media.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import threading
 from pathlib import Path
@@ -16,10 +17,10 @@ import pytest
 from ezdxf.recover import readfile
 
 from vectorjuju.calibrate import Scale
-from vectorjuju.convert import px_to_cad
 from vectorjuju.curves import classify
-from vectorjuju.export import LAYERS, write_outputs
-from vectorjuju.text import BoundCall, ParsedCall, TextItem
+from vectorjuju.export import LAYERS, _publish_lock_path, write_outputs
+from vectorjuju.pipeline import px_to_cad
+from vectorjuju.text import BoundCall, ParsedCall, TextItem, parse_call
 from vectorjuju.tracing import Run
 
 DPI = 200
@@ -149,10 +150,24 @@ def test_sidecar_matches_the_settled_schema(tmp_path):
         assert entry["type"] in {"line", "curve"}
         assert [[*_cad(point)] for point in run.points_px] == entry["points"]
         if entry["label"] is not None:
-            assert set(entry["label"]) == {"raw_text", "bearing", "distance", "radius"}
+            assert set(entry["label"]) == {
+                "raw_text",
+                "source_text",
+                "suspect_tokens",
+                "bearing",
+                "distance",
+                "radius",
+            }
 
     line_label = sidecar["entities"][0]["label"]
-    assert line_label == {"raw_text": "N 21°48'05\" E 100.00'", "bearing": 21.8, "distance": 100.0, "radius": None}
+    assert line_label == {
+        "raw_text": "N 21°48'05\" E 100.00'",
+        "source_text": "N 21°48'05\" E 100.00'",
+        "suspect_tokens": [],
+        "bearing": 21.8,
+        "distance": 100.0,
+        "radius": None,
+    }
     _, fit = classify(runs[1].points_px, DPI)
     assert sidecar["entities"][1]["label"]["radius"] == pytest.approx(fit.radius_px * FPP)
     assert sidecar["entities"][1]["label"]["bearing"] is None
@@ -164,6 +179,26 @@ def test_sidecar_matches_the_settled_schema(tmp_path):
             "insertion": list(_cad(((item.box_px[0] + item.box_px[2]) / 2, (item.box_px[1] + item.box_px[3]) / 2))),
         }
     ]
+
+
+def test_bound_label_keeps_the_source_read_and_the_corrections(tmp_path):
+    """A unit mark the parser corrected must stay distinguishable in the
+    sidecar: the canonical transcription alone cannot tell a real foot mark
+    from an OCR inch mark normalized into one."""
+    raw = 'N 0°00\'00" E 100.00"'
+    parsed = parse_call(raw)
+    assert parsed is not None and parsed.suspect_tokens == ("foot-mark",)
+    run = _line_run()
+    call = BoundCall(
+        call=parsed, run=run, item=TextItem(text=raw, box_px=(0.0, 0.0, 10.0, 10.0), source="page"), distance_px=0.0
+    )
+
+    _, sidecar = _write(tmp_path, [run], [call], [])
+
+    label = sidecar["entities"][0]["label"]
+    assert label["raw_text"] == "N 0°00'00\" E 100.00'"
+    assert label["source_text"] == raw
+    assert label["suspect_tokens"] == ["foot-mark"]
 
 
 def test_arc_is_the_fitted_circle_in_cad_units(tmp_path):
@@ -286,6 +321,29 @@ def test_empty_sheet_rejects_invalid_calibration_and_raster_metadata(tmp_path, s
     with pytest.raises(ValueError, match=match):
         write_outputs(tmp_path / "sheet.dxf", [], [], [], scale=scale, img_height=img_height, dpi=dpi)
     assert list(tmp_path.iterdir()) == []
+
+
+def test_the_publish_pair_is_taken_under_a_cross_process_lock(tmp_path):
+    """Two conversions to the same output must publish their DXF and sidecar
+    as a pair: the second writer waits on the lock rather than interleaving
+    its renames with the first one's."""
+    runs, bound, unbound = _planted()
+    out = tmp_path / "sheet.dxf"
+    writer = threading.Thread(
+        target=write_outputs,
+        args=(out, runs, bound, unbound),
+        kwargs={"scale": SCALE, "img_height": IMG_HEIGHT},
+    )
+    with _publish_lock_path(out).open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        writer.start()
+        writer.join(0.5)
+        assert writer.is_alive()  # still staging/publishing: it is waiting on the lock
+        fcntl.flock(lock, fcntl.LOCK_UN)
+    writer.join(5)
+
+    assert not writer.is_alive()
+    assert out.exists() and out.with_suffix(".json").exists()
 
 
 def test_a_failed_sidecar_publication_leaves_the_previous_pair_intact(tmp_path):

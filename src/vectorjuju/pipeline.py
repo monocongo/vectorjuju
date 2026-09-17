@@ -8,7 +8,7 @@ conversion point: raster pixels to CAD units (bottom-left origin, y up).
 
 ``convert()`` is the one end-to-end entry point: ingest -> trace -> OCR and
 bind -> calibrate -> DXF and JSON sidecar. The heavy pieces are imported when
-it runs, so ``import vectorjuju`` and ``import vectorjuju.convert`` stay free
+it runs, so ``import vectorjuju`` and ``import vectorjuju.pipeline`` stay free
 of cv2, skimage, and docling.
 
 There is no pixel-unit fallback: transforming before calibration raises.
@@ -177,7 +177,10 @@ def convert(
     traced = trace_runs(image, dpi)
     items = extract_text(image, traced, dpi=dpi)
     bound, unbound = bind_calls(traced, items, dpi=dpi)
-    calibration = calibrate_scale(bound, scale=scale, dpi=dpi)
+    # The neighbour population is every traced run, not just the bound ones:
+    # an unbound edge still closes the called edges around it, so calibration
+    # must measure the geometry conversion emits, not a bound-only subset.
+    calibration = calibrate_scale(bound, scale=scale, dpi=dpi, runs=traced)
     # Calls are read in feet, so RANSAC's fpp is feet per pixel. A metre
     # drawing's scale is metres per pixel: 1 US survey foot = 1200/3937 m
     # exactly. An explicit ``scale`` is already in the chosen unit, and
@@ -186,9 +189,9 @@ def convert(
     if units == "metre" and scale is None:
         calibration = Scale(value=calibration.value * 1200.0 / 3937.0, method=calibration.method)
     # Corner closure is emission geometry: calibration measured the traced runs
-    # (closing them itself, exactly this way), and the drawing gets the closed
-    # runs. Bound calls are remapped onto them by identity so the writer's
-    # run-to-label map survives.
+    # through the same closure, and the drawing gets the closed runs. Bound
+    # calls are remapped onto them by identity so the writer's run-to-label map
+    # survives.
     runs = join_corners(traced, dpi)
     remapped = {id(run): closed for run, closed in zip(traced, runs, strict=True)}
     bound = [replace(call, run=remapped[id(call.run)]) for call in bound]

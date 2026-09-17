@@ -18,8 +18,8 @@ import numpy as np
 from ezdxf.recover import readfile
 from PIL import Image, ImageDraw
 
-from vectorjuju.convert import cad_to_px
 from vectorjuju.curves import CircleFit
+from vectorjuju.pipeline import cad_to_px
 from vectorjuju.synthetic_plat import SCALE_PT_PER_FT
 
 # Overlay colours: the DXF's own layers, drawn over the input raster.

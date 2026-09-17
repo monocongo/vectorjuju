@@ -13,17 +13,22 @@ came from.
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import math
+import os
+import tempfile
 import threading
 from collections.abc import Sequence
 from pathlib import Path
+from uuid import uuid4
 
 import ezdxf
 
 from vectorjuju.calibrate import Scale
-from vectorjuju.convert import Units, _require_fpp, _require_img_height, px_to_cad
 from vectorjuju.curves import CircleFit, classify
+from vectorjuju.pipeline import Units, _require_fpp, _require_img_height, px_to_cad
 from vectorjuju.text import BoundCall, ParsedCall, TextItem
 from vectorjuju.tracing import Run
 
@@ -62,9 +67,12 @@ def write_outputs(
     ``bound`` are the calls bound to runs (one label each) and ``unbound``
     everything that never bound, which the sidecar keeps as ``unbound_text``.
 
-    Both artifacts are staged whole and then published sidecar first, so a
-    failure writing either one leaves the previous pair in place; only the two
-    renames can interleave, and POSIX has no two-file transaction above that.
+    Both artifacts are staged whole and then published sidecar first under an
+    exclusive cross-process lock, so a failure writing either one leaves the
+    previous pair in place and two conversions to one output cannot publish
+    one run's sidecar beside the other's DXF. POSIX has no two-file
+    transaction above that: a reader between the two renames can still see
+    one run's sidecar beside the previous DXF.
 
     Both files are byte-identical across runs over the same input: ezdxf
     otherwise stamps a version+timestamp marker at document creation, a
@@ -82,9 +90,11 @@ def write_outputs(
     if not math.isfinite(dpi) or dpi <= 0:
         raise ValueError(f"write_outputs requires a finite dpi > 0, got {dpi!r}")
     labels = {call.run: call for call in bound}
-    # Both staged beside their targets, so neither publish leaves a half file.
-    staged_dxf = out.with_suffix(out.suffix + ".tmp")
-    staged_sidecar = sidecar_path.with_suffix(".json.tmp")
+    # Unique staged names: two conversions targeting the same output never
+    # overwrite or delete each other's staging files.
+    token = f"{os.getpid()}.{uuid4().hex}"
+    staged_dxf = out.with_name(f"{out.name}.{token}.tmp")
+    staged_sidecar = sidecar_path.with_name(f"{sidecar_path.name}.{token}.tmp")
 
     def to_cad(point) -> tuple[float, float]:
         return px_to_cad(tuple(point), fpp=fpp, img_height=height)
@@ -133,14 +143,33 @@ def write_outputs(
         with staged_sidecar.open("w", encoding="utf-8") as handle:
             json.dump(sidecar, handle, indent=2)
             handle.write("\n")
-        staged_sidecar.replace(sidecar_path)
-        staged_dxf.replace(out)
+        # Both renames under one cross-process lock: without it two
+        # conversions to the same output can interleave their two renames and
+        # publish a sidecar from one beside a DXF from the other.
+        with _publish_lock_path(out).open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                staged_sidecar.replace(sidecar_path)
+                staged_dxf.replace(out)
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
     finally:
         staged_dxf.unlink(missing_ok=True)
         staged_sidecar.unlink(missing_ok=True)
         ezdxf.options.write_fixed_meta_data_for_testing = previous
         _META_LOCK.release()
     return out
+
+
+def _publish_lock_path(out: Path) -> Path:
+    """The cross-process publish lock for ``out``, keyed by its resolved path.
+
+    In the system temp directory, not beside the outputs: no lock file is left
+    in the caller's output directory, and every process converting to the same
+    output resolves to the same lock.
+    """
+    digest = hashlib.sha256(str(out.resolve()).encode()).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / f"vectorjuju-{digest}.lock"
 
 
 def _insunits(units: str) -> int:
@@ -214,13 +243,16 @@ def _run_rotation(cad: list[list[float]]) -> float:
 
 
 def _sidecar_label(call: BoundCall | None, fit: CircleFit | None, fpp: float) -> dict | None:
-    """The label's schema entry: the parsed call's own numbers, plus the fitted
-    arc radius in CAD units -- radius never comes from a call's OCR text."""
+    """The label's schema entry: the parsed call's own numbers, the untouched
+    read and any unit-mark corrections the parser made, plus the fitted arc
+    radius in CAD units -- radius never comes from a call's OCR text."""
     if call is None:
         return None
     parsed = call.call
     return {
         "raw_text": parsed.raw_text,
+        "source_text": call.item.text,
+        "suspect_tokens": list(parsed.suspect_tokens),
         "bearing": parsed.bearing_deg,
         "distance": parsed.distance_ft,
         "radius": fit.radius_px * fpp if fit is not None else None,

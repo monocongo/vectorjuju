@@ -16,6 +16,7 @@ import logging
 import math
 import re
 import sys
+import threading
 import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -271,16 +272,35 @@ def _converter():
     return DocumentConverter(format_options={InputFormat.IMAGE: ImageFormatOption(pipeline_options=options)})
 
 
+# A docling conversion has no cancellation and no timeout of its own: a
+# stalled model download, engine init, or inference would otherwise leave the
+# public convert() blocked with no failure result. The wait is bounded here;
+# the worker is a daemon so even a stalled one cannot block interpreter exit.
+# ponytail: the timed-out thread keeps running (threads are not cancellable);
+# a process-level OCR worker pool is the upgrade if stalled threads pile up.
+_OCR_TIMEOUT_S = 600.0
+
+
 def _convert_path(path: Path):
     # One unreadable page or crop must not kill the run, but the failure must
     # stay observable: logged here rather than silently folded into "no text
     # found" (an unavailable model asset or OCR init error looks identical to
     # a blank page otherwise).
-    try:
-        return _converter().convert(str(path)).document
-    except Exception:
-        _logger.warning("docling conversion failed for %s", path, exc_info=True)
+    result = []
+
+    def run() -> None:
+        try:
+            result.append(_converter().convert(str(path)).document)
+        except Exception:
+            _logger.warning("docling conversion failed for %s", path, exc_info=True)
+
+    worker = threading.Thread(target=run, name="docling-ocr", daemon=True)
+    worker.start()
+    worker.join(_OCR_TIMEOUT_S)
+    if worker.is_alive():
+        _logger.warning("docling conversion timed out after %.0fs for %s", _OCR_TIMEOUT_S, path)
         return None
+    return result[0] if result else None
 
 
 # OCR input scale. The fixture's 7.5 pt labels are ~21 px tall at the

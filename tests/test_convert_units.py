@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +14,7 @@ from PIL import Image, ImageChops, ImageStat
 from reportlab.pdfgen import canvas
 
 from vectorjuju import text as text_module
-from vectorjuju.convert import UnsupportedInputError, VectorjujuError, cad_to_px, load_raster, px_to_cad
+from vectorjuju.pipeline import UnsupportedInputError, VectorjujuError, cad_to_px, load_raster, px_to_cad
 from vectorjuju.synthetic_plat import PAGE_H, PAGE_W, PARCEL_FT, RENDER_DPI, bearing_distance, generate_sheet
 from vectorjuju.text import TextItem, bind_calls, extract_text, normalize_ocr, parse_call
 from vectorjuju.tracing import Run
@@ -116,7 +117,7 @@ def test_unsupported_inputs_raise_and_write_nothing(bad_inputs: Path, media: str
 def test_near_limit_rasters_are_rejected_by_the_ingest_budget(
     sheet: Path, media: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("vectorjuju.convert.MAX_INGEST_PIXELS", 8)
+    monkeypatch.setattr("vectorjuju.pipeline.MAX_INGEST_PIXELS", 8)
     with pytest.raises(UnsupportedInputError):
         load_raster(sheet / media)
 
@@ -340,6 +341,31 @@ def test_convert_path_logs_a_conversion_failure_instead_of_hiding_it(
 
     assert result is None
     assert "docling conversion failed" in caplog.text
+
+
+def test_convert_path_times_out_a_stalled_conversion(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    # A stalled model download or inference must not block convert() forever:
+    # the wait is bounded and the give-up is observable.
+    started, release = threading.Event(), threading.Event()
+
+    class _StalledConverter:
+        def convert(self, _path: str):
+            started.set()
+            release.wait(10)
+            raise RuntimeError("late failure after the caller gave up")
+
+    monkeypatch.setattr(text_module, "_converter", lambda: _StalledConverter())
+    monkeypatch.setattr(text_module, "_OCR_TIMEOUT_S", 0.05)
+
+    with caplog.at_level(logging.WARNING, logger=text_module.__name__):
+        result = text_module._convert_path(tmp_path / "page.png")
+
+    assert result is None
+    assert started.wait(1)
+    assert "timed out" in caplog.text
+    release.set()
 
 
 def test_extract_text_rejects_non_finite_or_nonpositive_dpi() -> None:

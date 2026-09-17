@@ -25,3 +25,13 @@ def test_writer_api_is_exported():
     from vectorjuju import export, write_outputs
 
     assert write_outputs is export.write_outputs
+
+
+def test_conversion_api_is_exported():
+    import importlib
+
+    from vectorjuju import UnsupportedInputError, convert
+
+    pipeline = importlib.import_module("vectorjuju.pipeline")
+    assert convert is pipeline.convert
+    assert UnsupportedInputError is pipeline.UnsupportedInputError

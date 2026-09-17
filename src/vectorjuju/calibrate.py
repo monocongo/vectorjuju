@@ -12,9 +12,9 @@ A traced run stops short of its corners: the skeleton's junction vertex sits
 inside the stroke, not at the centreline intersection, which is the slop the
 acceptance suite's 8 px end-reach gates allow. Its raw length therefore
 overshoots the scale by a few percent, so each end is first extended to the
-intersection with the neighbouring bound run's centreline -- corner-to-corner
-is what a recorded distance measures. ``tracing.join_corners`` applies the
-same closure to the geometry ``convert()`` emits, so the drawing and this
+intersection with the neighbouring run's centreline -- corner-to-corner
+is what a recorded distance measures. ``tracing._closed_run`` is that closure,
+shared with the geometry ``convert()`` emits, so the drawing and this
 measurement agree. A cell index keeps each end's search on the runs whose
 geometry is actually near it, so closure costs per run, not per run pair.
 
@@ -33,10 +33,10 @@ from typing import Literal
 
 import numpy as np
 
-from vectorjuju.convert import _require_fpp
 from vectorjuju.errors import VectorjujuError
+from vectorjuju.pipeline import _require_fpp
 from vectorjuju.text import BoundCall
-from vectorjuju.tracing import _CORNER_CLOSE_PX, Run, _cell_index, _closes_end, _nearby_runs
+from vectorjuju.tracing import _CORNER_CLOSE_PX, Run, _cell_index, _closed_run
 
 _REFERENCE_DPI = 200.0
 # Prior art: RANSAC needs at least three bound distance calls -- a consensus
@@ -76,38 +76,46 @@ def _scaled(px_at_reference_dpi: float, dpi: float) -> float:
 
 
 def _closed_run_length_px(
-    run_index: int, runs: Sequence[Run], index: dict[tuple[int, int], list[int]], cap: float
+    run_index: int, runs: Sequence[Run], index: dict[tuple[int, int], list[int]], cap: float, dpi: float
 ) -> float:
-    """Run length corner to corner: each end closed onto the neighbouring run.
+    """Run length corner to corner, on the same closed geometry ``convert()``
+    emits: ``tracing._closed_run`` is that closure.
 
-    ponytail: closure is best-effort -- an end whose neighbour never bound
-    (no call of its own) stays raw, and RANSAC then votes that sample out.
+    ponytail: closure is best-effort -- an end whose neighbour does not
+    terminate at the same corner stays raw, and RANSAC then votes that sample
+    out.
     """
-    points = runs[run_index].points_px
-    if len(points) < 2:
+    if len(runs[run_index].points_px) < 2:
         return 0.0  # nothing measurable to close; the caller's length > 0 gate skips it
-    cell = 2 * cap
-    closed = points.copy()
-    closed[0] = _closes_end(points, True, _nearby_runs(index, cell, points[0], runs, run_index), cap)
-    closed[-1] = _closes_end(points, False, _nearby_runs(index, cell, points[-1], runs, run_index), cap)
-    return sum(math.dist(a, b) for a, b in pairwise(closed))
+    points = _closed_run(runs[run_index], run_index, runs, index, cap, dpi).points_px
+    return sum(math.dist(a, b) for a, b in pairwise(points))
 
 
-def _usable_samples(bound_calls: Sequence[BoundCall], dpi: float) -> list[tuple[float, float]]:
+def _usable_samples(
+    bound_calls: Sequence[BoundCall], dpi: float, runs: Sequence[Run] | None = None
+) -> list[tuple[float, float]]:
     """(run length px, call distance) for every call that can calibrate.
 
-    A curve reference carries no distance, and a run with no measurable length
-    divides by zero; both are skipped, not guessed at.
+    ``runs`` is the neighbour population closure indexes: ``convert()`` passes
+    every traced run -- the geometry it emits -- so a called edge is measured
+    with the neighbours it will actually be closed against. Without it the
+    bound runs alone are the population, which is all a caller with no traced
+    set has. A curve reference carries no distance, and a run with no
+    measurable length divides by zero; both are skipped, not guessed at.
     """
-    runs = [bound.run for bound in bound_calls]
+    population = list(runs) if runs is not None else [bound.run for bound in bound_calls]
     cap = _scaled(_CORNER_CLOSE_PX, dpi)
-    index = _cell_index(runs, 2 * cap)
+    index = _cell_index(population, 2 * cap)
+    positions = {run: i for i, run in enumerate(population)}
     samples = []
-    for i, bound in enumerate(bound_calls):
+    for bound in bound_calls:
         distance = bound.call.distance_ft
         if bound.call.kind != "bearing_distance" or distance is None:
             continue
-        length = _closed_run_length_px(i, runs, index, cap)
+        position = positions.get(bound.run)
+        if position is None:
+            continue  # a call whose run is not in the population has no measured geometry
+        length = _closed_run_length_px(position, population, index, cap, dpi)
         if math.isfinite(distance) and distance > 0 and math.isfinite(length) and length > 0:
             samples.append((length, distance))
     return samples
@@ -168,7 +176,13 @@ def _ransac_fpp(samples: Sequence[tuple[float, float]]) -> tuple[float, np.ndarr
     return (fpp, best_inliers) if math.isfinite(fpp) else (0.0, empty)
 
 
-def calibrate_scale(bound_calls: Sequence[BoundCall], *, scale: float | None = None, dpi: float = 200.0) -> Scale:
+def calibrate_scale(
+    bound_calls: Sequence[BoundCall],
+    *,
+    scale: float | None = None,
+    dpi: float = 200.0,
+    runs: Sequence[Run] | None = None,
+) -> Scale:
     """Recover units per raster pixel from ``bound_calls``, or accept ``scale``.
 
     ``scale`` skips calibration outright -- even when the calls on hand cannot
@@ -177,13 +191,17 @@ def calibrate_scale(bound_calls: Sequence[BoundCall], *, scale: float | None = N
     length; the winning consensus is refit least-squares and returned with
     ``method="ransac"``. Raises ``ScaleCalibrationError`` when the calls are
     too few or disagree: never a pixel-unit fallback.
+
+    ``runs`` is the closure neighbour population: ``convert()`` passes every
+    traced run so the measured lengths and the emitted geometry close against
+    the same runs. It defaults to the bound calls' own runs.
     """
     if not math.isfinite(dpi) or dpi <= 0:
         raise ValueError(f"calibrate_scale requires a finite dpi > 0, got {dpi!r}")
     if scale is not None:
         return Scale(value=_require_fpp(scale, "calibrate_scale"), method="override")
 
-    samples = _usable_samples(bound_calls, dpi)
+    samples = _usable_samples(bound_calls, dpi, runs)
     if len(samples) < _MIN_SAMPLES:
         raise ScaleCalibrationError(
             f"only {len(samples)} usable bound distance call(s): need >= {_MIN_SAMPLES} to calibrate "
