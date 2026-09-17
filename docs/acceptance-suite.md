@@ -203,10 +203,11 @@ repeatable rather than a vibe.
 
 ## Dependencies
 
-`convert()` brings `ezdxf`, `numpy`, `docling`, OpenCV, `scikit-image`, and
-`pillow` as runtime dependencies; the suite adds none beyond those — `ezdxf` is
-what the gates reopen the DXF with, and `pypdfium2` is already a dev dependency,
-the overlay helper included. No matplotlib, no golden-image tooling.
+`convert()` brings `ezdxf`, `numpy`, `docling`, OpenCV, `scikit-image`,
+`scipy`, `pillow`, and `pypdfium2` as runtime dependencies; the suite adds none
+beyond those — `ezdxf` is what the gates reopen the DXF with, and `pypdfium2`
+is what the overlay helper reads a PDF page with, the same rasteriser
+`convert()` ingests through. No matplotlib, no golden-image tooling.
 
 ## Definition of done
 

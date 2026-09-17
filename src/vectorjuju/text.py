@@ -142,7 +142,8 @@ def parse_call(raw: str) -> ParsedCall | None:
     (a ``'`` misread as ``"`` or ``*`` becomes ``'``), and OCR noise glued
     onto the call's boundary -- tolerated above so a real read is not thrown
     away -- is not carried along. Each correction is recorded in
-    ``suspect_tokens``; the untouched read stays on the ``TextItem``.
+    ``suspect_tokens`` (a dropped glued fragment is not a token suspect); the
+    untouched read stays on the ``TextItem``.
     """
     text = normalize_ocr(raw)
 

@@ -40,6 +40,9 @@ jobs:
     # A skip is not a pass: the OCR path must run over all three media, and a
     # red gate here means the MVP is not done (docs/acceptance-suite.md).
     runs-on: ubuntu-latest
+    # Well above the ~7 min a warm model cache takes, and far below the job's
+    # default: a stalled engine must fail the gate, not occupy the runner.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
         with:
