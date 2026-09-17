@@ -598,25 +598,37 @@ def bind_calls(
     # out of ``unbound_text`` too. Every earlier read stays a peer, merged ones
     # included, so a chain of mutually overlapping reads (page -> crop -> crop)
     # collapses whole: a read overlapping only a merged duplicate is still the
-    # same physical label, and the first read remains the representative.
-    distinct: list[tuple[int, ParsedCall]] = []
+    # same physical label. The first read stays the representative the label is
+    # drawn at; the gate is measured from whichever read sits nearest the run.
+    groups: list[list[int]] = []  # one group per distinct call: every read merged into it
+    calls: list[ParsedCall] = []
     boxes_by_call: dict[tuple[object, ...], list[int]] = {}
+    group_of: dict[int, int] = {}
     merged_item_indices: set[int] = set()
     for item_index, call in callable_items:
         key = (call.kind, call.bearing_deg, call.distance_ft, call.curve_id)
         peers = boxes_by_call.setdefault(key, [])
-        duplicate = any(_boxes_overlap(items[item_index].box_px, items[peer].box_px) for peer in peers)
+        overlapped = next(
+            (peer for peer in peers if _boxes_overlap(items[item_index].box_px, items[peer].box_px)), None
+        )
         peers.append(item_index)
-        if duplicate:
-            merged_item_indices.add(item_index)
+        if overlapped is None:
+            group_of[item_index] = len(groups)
+            groups.append([item_index])
+            calls.append(call)
             continue
-        distinct.append((item_index, call))
-    callable_items = distinct
+        merged_item_indices.add(item_index)
+        group_of[item_index] = group_of[overlapped]
+        groups[group_of[overlapped]].append(item_index)
 
+    # A group's distance to a run is its nearest read's, not its first read's:
+    # the page pass comes first and its wide, axis-aligned box can sit outside
+    # the gate while the crop pass's tight box is on the run. Measuring the
+    # representative alone would strand a call the crop pass had recovered.
     distances = np.array(
         [
-            [_point_run_distance(_center(items[item_index].box_px), run) for run in runs]
-            for item_index, _ in callable_items
+            [min(_point_run_distance(_center(items[peer].box_px), run) for peer in group) for run in runs]
+            for group in groups
         ]
     )
     # A penalty cell must cost more than a whole fully in-gate assignment can
@@ -638,13 +650,14 @@ def bind_calls(
         distance = float(distances[row, col])
         if distance > gate:
             continue  # every candidate run for this item was out of gate
-        item_index, call = callable_items[row]
-        bound.append(BoundCall(call=call, run=runs[col], item=items[item_index], distance_px=distance))
-        bound_item_indices.add(item_index)
+        call = calls[row]
+        representative = groups[row][0]
+        bound.append(BoundCall(call=call, run=runs[col], item=items[representative], distance_px=distance))
+        bound_item_indices.add(representative)
 
     # row_index is sorted ascending (scipy guarantees this), and rows follow
-    # callable_items' -- hence items' -- own order, so this needs no extra
-    # sort to stay deterministic (A8).
+    # ``calls``' -- hence items' -- own order, so this needs no extra sort to
+    # stay deterministic (A8).
     unbound = [
         item for index, item in enumerate(items) if index not in bound_item_indices and index not in merged_item_indices
     ]

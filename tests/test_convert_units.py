@@ -559,6 +559,26 @@ def test_bind_calls_collapses_a_chain_of_overlapping_duplicate_reads() -> None:
     assert by_call[normalize_ocr(other.text)] is run2
 
 
+def test_bind_calls_binds_on_the_nearest_read_of_a_collapsed_duplicate() -> None:
+    """Regression: a collapsed group's binding distance must be its nearest
+    read's, not the first (page-pass, non-deskewed) read's. A page box wide
+    enough to miss the gate while the band crop's tight box sits on the run
+    stranded a call the crop pass had recovered."""
+    call = "N 90°00'00\" E   30.00'"
+    boundary = _run([(0.0, 0.0), (30.0, 0.0)])
+    # dpi=100 gates at 30 px: the page centre (64, 2) is out of gate, the crop
+    # centre (30, 2) is 2 px from the run, and the two boxes overlap.
+    page = TextItem(text=call, box_px=(28.0, 0.0, 100.0, 4.0), source="page")
+    crop = TextItem(text=call, box_px=(28.0, 0.0, 32.0, 4.0), source="crop")
+
+    bound, unbound = bind_calls([boundary], [page, crop], dpi=100.0)
+
+    assert unbound == []
+    assert len(bound) == 1
+    assert bound[0].run is boundary
+    assert bound[0].item is page  # the first read stays the representative
+
+
 def test_bind_calls_is_deterministic() -> None:
     boundary = _run([(0.0, 0.0), (200.0, 0.0)])
     other = _run([(0.0, 300.0), (200.0, 300.0)])
