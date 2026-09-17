@@ -9,13 +9,18 @@ Runs are simplified polylines in raster pixels (top-left origin, y down);
 ``convert()`` maps them to CAD units. Rejection is geometric, never
 content-based: strokes thinner than a boundary stroke are right-of-way/setback
 lines and curve-table borders, and runs too small to be a boundary stroke are
-glyphs and monument marks.
+glyphs and monument marks. ``join_corners`` closes the skeleton's shortfall at
+a shared corner, which is what makes a traced run the length of the edge its
+bound call measures.
 """
 
 from __future__ import annotations
 
+import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from heapq import heappop, heappush
+from itertools import pairwise
 
 import cv2
 import numpy as np
@@ -23,6 +28,16 @@ from PIL import Image
 from skimage.morphology import skeletonize
 
 _REFERENCE_DPI = 200.0
+
+# Skeleton junction vertices stop ~5-8 px short of a corner at the reference
+# dpi (the suite's end-reach slop), and the neighbouring run is short too, so
+# closing an end may travel up to the sum of both shortfalls. 16 px covers
+# that with headroom while staying far inside the distance between real
+# boundary runs.
+_CORNER_CLOSE_PX = 16.0
+# A neighbour whose centreline is nearly parallel is a merged dash or an
+# offset line, not a corner; the tracer's own corner threshold is 15 degrees.
+_CORNER_SIN = math.sin(math.radians(15.0))
 
 # Thresholds are px at the reference DPI and scale with the run's dpi, so the
 # same figure traces the same way at 100 and 400 dpi. 3.0 px separates the
@@ -113,6 +128,173 @@ def trace_runs(
             continue
         runs.append(Run(points_px=_simplify(span, dpi)))
     return runs
+
+
+def join_corners(runs: Sequence[Run], dpi: float = _REFERENCE_DPI) -> list[Run]:
+    """Close run ends onto the corner the neighbouring run's centreline makes.
+
+    Thinning puts a junction where the two inked strokes overlap, not at the
+    geometric corner: each run's extreme vertex sits a stroke-width-dependent
+    distance short of the edge it traces. That shortfall is ~2 % of a parcel
+    edge -- the same edge whose length calibrates feet-per-pixel and whose
+    corner an ARC's endpoint is supposed to reach -- so emitted geometry is
+    closed the same way ``calibrate_scale`` closes it for measurement:
+    intersect each end's ray with the neighbouring run's centreline and take
+    the nearest crossing inside ``_CORNER_CLOSE_PX``. A parallel neighbour is
+    rejected by the angle test, so a right-of-way line never captures a
+    boundary run's end.
+    """
+    if len(runs) < 2:
+        return list(runs)
+    cap = _scaled(_CORNER_CLOSE_PX, dpi)
+    index = _cell_index(runs, 2 * cap)
+    return [_closed_run(run, run_index, runs, index, cap, dpi) for run_index, run in enumerate(runs)]
+
+
+def _closed_run(
+    run: Run, run_index: int, runs: Sequence[Run], index: dict[tuple[int, int], list[int]], cap: float, dpi: float
+) -> Run:
+    """One run with each end closed onto its corner.
+
+    The closure measurement (``calibrate_scale``) and the emitted geometry
+    both come through here, so a called edge is measured against exactly the
+    neighbours it is later closed against.
+    """
+    points = run.points_px
+    if len(points) > 2 and np.array_equal(points[0], points[-1]):
+        # A cycle's two ends are one junction, and their outward rays point
+        # opposite ways: extending each onto a neighbour's centreline splits
+        # that junction into two points, and the writer then emits the loop as
+        # an open run -- a degenerate ARC, or a polyline with a gap. Its length
+        # is already corner to corner, so calibration loses nothing.
+        return run
+    moved = points.copy()
+    ends: list[int] = []
+    for at_start in (True, False):
+        end = 0 if at_start else -1
+        closed = _closes_end(points, at_start, _nearby_runs(index, 2 * cap, points[end], runs, run_index), cap)
+        if not np.array_equal(closed, points[end]):
+            moved[end] = closed
+            ends.append(end)
+    if ends:
+        moved = _seat_curve_ends(points, moved, ends, dpi)
+    return Run(points_px=moved)
+
+
+def _seat_curve_ends(points: np.ndarray, moved: np.ndarray, ends: list[int], dpi: float) -> np.ndarray:
+    """Pull a curved run's closed ends back onto its own fitted circle.
+
+    A corner sits on the neighbouring centreline and on the curve's circle;
+    closing the end onto the neighbour's centreline alone can land off the
+    circle, and two off-circle endpoints out of six skew the writer's own
+    least-squares fit -- measured at ~9 % radius error on the fixture's clean
+    48-vertex arc. Projecting each moved end radially back onto the circle fit
+    through the traced points keeps the radius the tracer earned and still
+    puts the ARC's endpoint on the corner.
+    """
+    from vectorjuju.curves import classify  # local: curves imports this module
+
+    kind, fit = classify(points, dpi)
+    if kind != "curve" or fit is None:
+        return moved
+    centre = np.asarray(fit.center_px)
+    for end in ends:
+        vector = moved[end] - centre
+        norm = float(np.hypot(*vector))
+        if norm:  # a corner landing exactly on the centre has no radial direction to project along
+            moved[end] = centre + vector * (fit.radius_px / norm)
+    return moved
+
+
+def _closest_point(point: np.ndarray, points: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+    """Distance to a polyline, its nearest point, and that segment's unit direction."""
+    best = (math.inf, point, np.zeros(2))
+    for a, b in pairwise(points):
+        edge = b - a
+        length = float(np.hypot(*edge))
+        if length == 0:
+            continue
+        t = max(0.0, min(1.0, float((point - a) @ edge) / (length * length)))
+        nearest = a + t * edge
+        distance = float(np.linalg.norm(point - nearest))
+        if distance < best[0]:
+            best = (distance, nearest, edge / length)
+    return best
+
+
+def _closes_end(points: np.ndarray, at_start: bool, neighbours: Sequence[np.ndarray], cap: float) -> np.ndarray:
+    """Extend one run end to its corner.
+
+    Intersects the run's outward end ray with each neighbour's centreline and
+    takes the smallest valid crossing; the end is returned unchanged when no
+    neighbour meets it inside the cap. A neighbour only counts when it also
+    terminates at that corner (one of its own ends is within the cap), so an
+    unrelated stroke passing within reach -- a tie, an adjacent boundary --
+    cannot capture the end into its linework.
+    """
+    end = points[0] if at_start else points[-1]
+    direction = _end_direction(points, at_start)
+    if direction is None:
+        return end
+    best: tuple[float, np.ndarray | None] = (math.inf, None)
+    for neighbour in neighbours:
+        distance, nearest, edge = _closest_point(end, neighbour)
+        if distance > 2 * cap or abs(direction[0] * edge[1] - direction[1] * edge[0]) < _CORNER_SIN:
+            continue
+        try:
+            along, across = np.linalg.solve(
+                np.array([[direction[0], -edge[0]], [direction[1], -edge[1]]]), nearest - end
+            )
+        except np.linalg.LinAlgError:  # parallel, already guarded; keep the degenerate safe
+            continue
+        if not (0.0 < along <= cap and abs(across) <= cap and along < best[0]):
+            continue
+        corner = end + along * direction
+        if float(np.hypot(*(corner - neighbour[0]))) > cap and float(np.hypot(*(corner - neighbour[-1]))) > cap:
+            continue
+        best = (float(along), corner)
+    return best[1] if best[1] is not None else end
+
+
+def _cell_index(runs: Sequence[Run], cell_px: float) -> dict[tuple[int, int], list[int]]:
+    """Run indices by raster cell, so closure looks up neighbours instead of
+    scanning every other run's polyline at every end.
+
+    Cells are walked along each segment, not filled over its bounding box: a
+    long diagonal run costs the cells it crosses, not its box's area. A run
+    is listed once per contiguous cell run, so its entries track its length.
+    """
+    index: dict[tuple[int, int], list[int]] = {}
+    for i, run in enumerate(runs):
+        last: tuple[int, int] | None = None
+        for a, b in pairwise(run.points_px):
+            dx, dy = float(b[0] - a[0]), float(b[1] - a[1])
+            steps = max(1, math.ceil(max(abs(dx), abs(dy)) / cell_px))
+            for step in range(steps + 1):
+                t = step / steps
+                cell = (int((a[0] + t * dx) // cell_px), int((a[1] + t * dy) // cell_px))
+                if cell != last:
+                    index.setdefault(cell, []).append(i)
+                    last = cell
+    return index
+
+
+def _nearby_runs(
+    index: dict[tuple[int, int], list[int]], cell_px: float, point: np.ndarray, runs: Sequence[Run], skip: int
+) -> list[np.ndarray]:
+    """Polylines of the runs in the 3x3 cell block around ``point``.
+
+    The cell is twice the closure cap, so every run whose centreline comes
+    within reach of ``point`` -- the only ones ``_closes_end`` can use -- is
+    inside that block.
+    """
+    cx, cy = int(point[0] // cell_px), int(point[1] // cell_px)
+    near: set[int] = set()
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            near.update(index.get((cx + dx, cy + dy), ()))
+    near.discard(skip)
+    return [runs[i].points_px for i in sorted(near)]
 
 
 def _binarize(gray: np.ndarray) -> np.ndarray:

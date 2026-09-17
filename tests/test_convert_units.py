@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +14,7 @@ from PIL import Image, ImageChops, ImageStat
 from reportlab.pdfgen import canvas
 
 from vectorjuju import text as text_module
-from vectorjuju.convert import UnsupportedInputError, VectorjujuError, cad_to_px, load_raster, px_to_cad
+from vectorjuju.pipeline import UnsupportedInputError, VectorjujuError, cad_to_px, load_raster, px_to_cad
 from vectorjuju.synthetic_plat import PAGE_H, PAGE_W, PARCEL_FT, RENDER_DPI, bearing_distance, generate_sheet
 from vectorjuju.text import TextItem, bind_calls, extract_text, normalize_ocr, parse_call
 from vectorjuju.tracing import Run
@@ -116,7 +117,7 @@ def test_unsupported_inputs_raise_and_write_nothing(bad_inputs: Path, media: str
 def test_near_limit_rasters_are_rejected_by_the_ingest_budget(
     sheet: Path, media: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("vectorjuju.convert.MAX_INGEST_PIXELS", 8)
+    monkeypatch.setattr("vectorjuju.pipeline.MAX_INGEST_PIXELS", 8)
     with pytest.raises(UnsupportedInputError):
         load_raster(sheet / media)
 
@@ -342,6 +343,31 @@ def test_convert_path_logs_a_conversion_failure_instead_of_hiding_it(
     assert "docling conversion failed" in caplog.text
 
 
+def test_convert_path_times_out_a_stalled_conversion(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    # A stalled model download or inference must not block convert() forever:
+    # the wait is bounded and the give-up is observable.
+    started, release = threading.Event(), threading.Event()
+
+    class _StalledConverter:
+        def convert(self, _path: str):
+            started.set()
+            release.wait(10)
+            raise RuntimeError("late failure after the caller gave up")
+
+    monkeypatch.setattr(text_module, "_converter", lambda: _StalledConverter())
+    monkeypatch.setattr(text_module, "_OCR_TIMEOUT_S", 0.05)
+
+    with caplog.at_level(logging.WARNING, logger=text_module.__name__):
+        result = text_module._convert_path(tmp_path / "page.png")
+
+    assert result is None
+    assert started.wait(1)
+    assert "timed out" in caplog.text
+    release.set()
+
+
 def test_extract_text_rejects_non_finite_or_nonpositive_dpi() -> None:
     for bad_dpi in (0.0, -1.0, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="dpi"):
@@ -507,8 +533,8 @@ def test_bind_calls_collapses_duplicate_reads_of_one_call() -> None:
     assert unbound == []
     assert len(bound) == 2
     by_call = {bc.call.raw_text: bc.run for bc in bound}
-    assert by_call[call] is run1  # page geometry kept; crop duplicate dropped
-    assert by_call[other.text] is run2
+    assert by_call[normalize_ocr(call)] is run1  # page geometry kept; crop duplicate dropped
+    assert by_call[normalize_ocr(other.text)] is run2
 
 
 def test_bind_calls_collapses_a_chain_of_overlapping_duplicate_reads() -> None:
@@ -529,8 +555,28 @@ def test_bind_calls_collapses_a_chain_of_overlapping_duplicate_reads() -> None:
     assert unbound == []
     assert len(bound) == 2
     by_call = {bc.call.raw_text: bc.run for bc in bound}
-    assert by_call[call] is run1  # page geometry kept; both crop duplicates dropped
-    assert by_call[other.text] is run2
+    assert by_call[normalize_ocr(call)] is run1  # page geometry kept; both crop duplicates dropped
+    assert by_call[normalize_ocr(other.text)] is run2
+
+
+def test_bind_calls_binds_on_the_nearest_read_of_a_collapsed_duplicate() -> None:
+    """Regression: a collapsed group's binding distance must be its nearest
+    read's, not the first (page-pass, non-deskewed) read's. A page box wide
+    enough to miss the gate while the band crop's tight box sits on the run
+    stranded a call the crop pass had recovered."""
+    call = "N 90°00'00\" E   30.00'"
+    boundary = _run([(0.0, 0.0), (30.0, 0.0)])
+    # dpi=100 gates at 30 px: the page centre (64, 2) is out of gate, the crop
+    # centre (30, 2) is 2 px from the run, and the two boxes overlap.
+    page = TextItem(text=call, box_px=(28.0, 0.0, 100.0, 4.0), source="page")
+    crop = TextItem(text=call, box_px=(28.0, 0.0, 32.0, 4.0), source="crop")
+
+    bound, unbound = bind_calls([boundary], [page, crop], dpi=100.0)
+
+    assert unbound == []
+    assert len(bound) == 1
+    assert bound[0].run is boundary
+    assert bound[0].item is page  # the first read stays the representative
 
 
 def test_bind_calls_is_deterministic() -> None:

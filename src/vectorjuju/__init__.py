@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from vectorjuju.calibrate import Scale, ScaleCalibrationError, calibrate_scale
     from vectorjuju.export import write_outputs
+    from vectorjuju.pipeline import UnsupportedInputError, convert
     from vectorjuju.text import (
         BoundCall,
         ParsedCall,
@@ -22,6 +23,7 @@ __version__ = importlib.metadata.version("vectorjuju")
 
 _CALIBRATE_NAMES = {"Scale", "ScaleCalibrationError", "calibrate_scale"}
 _EXPORT_NAMES = {"write_outputs"}
+_PIPELINE_NAMES = {"UnsupportedInputError", "convert"}
 _TRACING_NAMES = {"Run", "trace_runs"}
 _TEXT_NAMES = {
     "BoundCall",
@@ -41,9 +43,11 @@ __all__ = [
     "Scale",
     "ScaleCalibrationError",
     "TextItem",
+    "UnsupportedInputError",
     "__version__",
     "bind_calls",
     "calibrate_scale",
+    "convert",
     "extract_text",
     "page_items",
     "parse_call",
@@ -54,7 +58,11 @@ __all__ = [
 
 
 def __getattr__(name: str):
-    """Import the tracing/text/calibration APIs lazily: `import vectorjuju` must not need cv2/skimage/docling."""
+    """Import the pipeline/tracing/text/calibration APIs lazily: `import vectorjuju` must not need cv2/skimage/docling."""
+    if name in _PIPELINE_NAMES:
+        from vectorjuju import pipeline
+
+        return getattr(pipeline, name)
     if name in _TRACING_NAMES:
         from vectorjuju import tracing
 

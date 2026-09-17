@@ -15,6 +15,8 @@ from __future__ import annotations
 import logging
 import math
 import re
+import sys
+import threading
 import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -134,13 +136,21 @@ def parse_call(raw: str) -> ParsedCall | None:
     bare ``C<n>``; that single rule rejects every curve-table cell for free
     (a radius cell has no bearing, a chord-bearing cell has no distance,
     ``PARCEL 5``/``LOT 12`` have neither) without special-casing any of them.
+
+    ``ParsedCall.raw_text`` is the call as it should be transcribed: unit
+    marks the parser positioned itself are written in their canonical form
+    (a ``'`` misread as ``"`` or ``*`` becomes ``'``), and OCR noise glued
+    onto the call's boundary -- tolerated above so a real read is not thrown
+    away -- is not carried along. Each correction is recorded in
+    ``suspect_tokens`` (a dropped glued fragment is not a token suspect); the
+    untouched read stays on the ``TextItem``.
     """
     text = normalize_ocr(raw)
 
     curve = _CURVE_REF_RE.fullmatch(text)
     if curve:
         return ParsedCall(
-            raw_text=raw,
+            raw_text=f"C{curve.group(1)}",
             kind="curve_ref",
             bearing_deg=None,
             distance_ft=None,
@@ -195,8 +205,15 @@ def parse_call(raw: str) -> ParsedCall | None:
     if distance_match.group(2) != "'":
         suspects.append("foot-mark")
 
+    canonical = f"{q1} {deg}°"
+    if minutes is not None:
+        canonical += f"{minutes}'"
+    if seconds is not None:
+        canonical += f'{seconds}"'
+    canonical += f" {q2} {distance_match.group(1)}'"
+
     return ParsedCall(
-        raw_text=raw,
+        raw_text=canonical,
         kind="bearing_distance",
         bearing_deg=_azimuth(q1, q2, angle),
         distance_ft=float(distance_match.group(1)),
@@ -240,9 +257,29 @@ def _center(box: tuple[float, float, float, float]) -> tuple[float, float]:
 
 @lru_cache(maxsize=1)
 def _converter():
-    from docling.document_converter import DocumentConverter
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import OcrMacOptions, PdfPipelineOptions, RapidOcrOptions
+    from docling.document_converter import DocumentConverter, ImageFormatOption
 
-    return DocumentConverter()
+    # The platform's engine, pinned the same way pyproject's extras pick it
+    # (ocrmac on macOS, RapidOCR elsewhere), and scale=1.0 because OCR inputs
+    # are pre-scaled by _ocr_image. OcrAutoOptions does not carry the scale
+    # through to the engine it resolves: docling then resamples the image a
+    # second time, which is both a needless blur and -- on a large scanned
+    # sheet, where the whole page is one bitmap region -- a decompression-bomb
+    # failure.
+    engine = OcrMacOptions if sys.platform == "darwin" else RapidOcrOptions
+    options = PdfPipelineOptions(ocr_options=engine(scale=1.0))
+    return DocumentConverter(format_options={InputFormat.IMAGE: ImageFormatOption(pipeline_options=options)})
+
+
+# A docling conversion has no cancellation and no timeout of its own: a
+# stalled model download, engine init, or inference would otherwise leave the
+# public convert() blocked with no failure result. The wait is bounded here;
+# the worker is a daemon so even a stalled one cannot block interpreter exit.
+# ponytail: the timed-out thread keeps running (threads are not cancellable);
+# a process-level OCR worker pool is the upgrade if stalled threads pile up.
+_OCR_TIMEOUT_S = 600.0
 
 
 def _convert_path(path: Path):
@@ -250,21 +287,63 @@ def _convert_path(path: Path):
     # stay observable: logged here rather than silently folded into "no text
     # found" (an unavailable model asset or OCR init error looks identical to
     # a blank page otherwise).
-    try:
-        return _converter().convert(str(path)).document
-    except Exception:
-        _logger.warning("docling conversion failed for %s", path, exc_info=True)
+    result = []
+
+    def run() -> None:
+        try:
+            result.append(_converter().convert(str(path)).document)
+        except Exception:
+            _logger.warning("docling conversion failed for %s", path, exc_info=True)
+
+    worker = threading.Thread(target=run, name="docling-ocr", daemon=True)
+    worker.start()
+    worker.join(_OCR_TIMEOUT_S)
+    if worker.is_alive():
+        _logger.warning("docling conversion timed out after %.0fs for %s", _OCR_TIMEOUT_S, path)
         return None
+    return result[0] if result else None
 
 
-def _doc_items(doc, height: int, source: str) -> list[TextItem]:
+# OCR input scale. The fixture's 7.5 pt labels are ~21 px tall at the
+# reference 200 dpi, and both engines misread them at native resolution
+# (RapidOCR dropped a decimal point or a digit on Linux; ocrmac's reads are
+# stable but lossy), and at 2x RapidOCR still misses the short curve-ref
+# labels. Handing the engines a LANCZOS 3x pre-scale instead of docling's own
+# default 3.0x resample keeps the reads correct on both. The cap is what
+# bounds our own buffer: just under Pillow's decompression-bomb ceiling,
+# which is the failure a larger input produces. A 24x18 in sheet at 200 dpi
+# (17 MP) still lands at 3x under it; only a bigger page is scaled less.
+_OCR_UPSCALE = 3.0
+_OCR_MAX_PIXELS = 160_000_000
+
+
+def _ocr_image(image: Image.Image) -> tuple[Image.Image, float]:
+    """The image handed to OCR, and the factor its pixels were scaled by."""
+    factor = min(_OCR_UPSCALE, math.sqrt(_OCR_MAX_PIXELS / (image.width * image.height)))
+    if factor <= 1.0:
+        return image, 1.0
+    return image.resize((round(image.width * factor), round(image.height * factor)), Image.LANCZOS), factor
+
+
+def _doc_items(doc, height: int, source: str, factor: float = 1.0) -> list[TextItem]:
+    """One TextItem per docling text region, boxes back in the caller's pixels.
+
+    ``height`` is the OCR image's own height and ``factor`` the scale
+    ``_ocr_image`` applied, so boxes come back in the image the caller has.
+    """
     items = []
     for t in doc.texts:
         if not t.prov or not t.text.strip():
             continue
         b = t.prov[0].bbox
         top, bottom = max(b.t, b.b), min(b.t, b.b)  # docling: bottom-left origin
-        items.append(TextItem(text=t.text, box_px=(b.l, height - top, b.r, height - bottom), source=source))
+        items.append(
+            TextItem(
+                text=t.text,
+                box_px=(b.l / factor, (height - top) / factor, b.r / factor, (height - bottom) / factor),
+                source=source,
+            )
+        )
     return items
 
 
@@ -276,14 +355,16 @@ def page_items(image: Image.Image) -> list[TextItem]:
     ``extract_text(..., page_items=...)`` (after) to run this page-pass once
     instead of once per call.
     """
-    page_h = image.size[1]
+    ocr, factor = _ocr_image(image)
+    height = ocr.size[1]
     with TemporaryDirectory() as tmp:
         path = Path(tmp) / "page.png"
-        image.save(path, format="PNG")
+        ocr.save(path, format="PNG")
+        del ocr  # the upscaled buffer is dead once saved; docling decodes its own copy
         doc = _convert_path(path)
     if doc is None:
         return []
-    return _doc_items(doc, page_h, "page")
+    return _doc_items(doc, height, "page", factor)
 
 
 _page_items = page_items  # internal alias: extract_text's page_items kwarg shadows the module-level name
@@ -324,24 +405,43 @@ def warp_band(
     return Image.fromarray(warped), m
 
 
-def _ocr_band(band: Image.Image) -> tuple[str, tuple[float, float, float, float] | None]:
-    """OCR one band; returns its text and the band-local bbox spanning every
-    OCR'd text region that contributed to it (``None`` if none did)."""
+def _ocr_band(band: Image.Image) -> list[TextItem]:
+    """OCR one band into one TextItem per region, boxes in the band's pixels."""
+    ocr, factor = _ocr_image(band)
+    height = ocr.size[1]
     with TemporaryDirectory() as tmp:
         path = Path(tmp) / "band.png"
-        band.save(path, format="PNG")
+        ocr.save(path, format="PNG")
+        del ocr  # the upscaled buffer is dead once saved; docling decodes its own copy
         doc = _convert_path(path)
     if doc is None:
-        return "", None
-    items = _doc_items(doc, band.size[1], "crop")
-    text = " ".join(item.text for item in items)
+        return []
+    return _doc_items(doc, height, "crop", factor)
+
+
+def _band_call(items: Sequence[TextItem]) -> tuple[str, tuple[float, float, float, float]] | None:
+    """The band's own call, or ``None`` when no read parses as one.
+
+    The band's regions are tried joined first -- a bearing call is routinely
+    split across OCR regions -- and then one at a time. A curve ref is a
+    two-character read that an engine can return beside a spurious region (a
+    sliver of the very line it labels), and joining that in would fail a read
+    the band already had.
+    """
     if not items:
-        return text, None
-    x0 = min(item.box_px[0] for item in items)
-    y0 = min(item.box_px[1] for item in items)
-    x1 = max(item.box_px[2] for item in items)
-    y1 = max(item.box_px[3] for item in items)
-    return text, (x0, y0, x1, y1)
+        return None
+    joined = " ".join(item.text for item in items)
+    if parse_call(joined) is not None:
+        return joined, (
+            min(item.box_px[0] for item in items),
+            min(item.box_px[1] for item in items),
+            max(item.box_px[2] for item in items),
+            max(item.box_px[3] for item in items),
+        )
+    for item in items:
+        if parse_call(item.text) is not None:
+            return item.text, item.box_px
+    return None
 
 
 def _band_box_to_image(
@@ -390,22 +490,19 @@ def _crop_item(image: Image.Image, run: Run, dpi: float) -> TextItem | None:
     half_h = min(_scaled(110.0, dpi), _MAX_CROP_SIDE_PX / 2)
     band, m = warp_band(image, (float(x0), float(y0), float(x1), float(y1)), center, half_len, half_h)
 
-    text, box_local = _ocr_band(band)
+    picked = _band_call(_ocr_band(band))
     rotated = False
-    if parse_call(text) is None:
+    if picked is None:
         # A traced run has no arrowhead; try the band's own 180-degree twin
         # and keep it only if it actually parses -- prefer a read that
         # succeeds over one with merely more characters (prototypes/
         # diagonal_call_labels.py's alnum-count tie-break is a measured
         # crutch: commit 50e54ed shows it flips on stray OCR periods).
-        rotated_text, rotated_box_local = _ocr_band(band.rotate(180))
-        if parse_call(rotated_text) is not None:
-            text, box_local, rotated = rotated_text, rotated_box_local, True
-
-    if parse_call(text) is None:
+        picked = _band_call(_ocr_band(band.rotate(180)))
+        rotated = picked is not None
+    if picked is None:
         return None
-    # box_local is only ever None when text is "" (no OCR'd region
-    # contributed to it), and an empty text never survives parse_call above.
+    text, box_local = picked
     box_px = _band_box_to_image(box_local, band.size, m, rotated=rotated)
     return TextItem(text=text, box_px=box_px, source="crop")
 
@@ -506,25 +603,37 @@ def bind_calls(
     # out of ``unbound_text`` too. Every earlier read stays a peer, merged ones
     # included, so a chain of mutually overlapping reads (page -> crop -> crop)
     # collapses whole: a read overlapping only a merged duplicate is still the
-    # same physical label, and the first read remains the representative.
-    distinct: list[tuple[int, ParsedCall]] = []
+    # same physical label. The first read stays the representative the label is
+    # drawn at; the gate is measured from whichever read sits nearest the run.
+    groups: list[list[int]] = []  # one group per distinct call: every read merged into it
+    calls: list[ParsedCall] = []
     boxes_by_call: dict[tuple[object, ...], list[int]] = {}
+    group_of: dict[int, int] = {}
     merged_item_indices: set[int] = set()
     for item_index, call in callable_items:
         key = (call.kind, call.bearing_deg, call.distance_ft, call.curve_id)
         peers = boxes_by_call.setdefault(key, [])
-        duplicate = any(_boxes_overlap(items[item_index].box_px, items[peer].box_px) for peer in peers)
+        overlapped = next(
+            (peer for peer in peers if _boxes_overlap(items[item_index].box_px, items[peer].box_px)), None
+        )
         peers.append(item_index)
-        if duplicate:
-            merged_item_indices.add(item_index)
+        if overlapped is None:
+            group_of[item_index] = len(groups)
+            groups.append([item_index])
+            calls.append(call)
             continue
-        distinct.append((item_index, call))
-    callable_items = distinct
+        merged_item_indices.add(item_index)
+        group_of[item_index] = group_of[overlapped]
+        groups[group_of[overlapped]].append(item_index)
 
+    # A group's distance to a run is its nearest read's, not its first read's:
+    # the page pass comes first and its wide, axis-aligned box can sit outside
+    # the gate while the crop pass's tight box is on the run. Measuring the
+    # representative alone would strand a call the crop pass had recovered.
     distances = np.array(
         [
-            [_point_run_distance(_center(items[item_index].box_px), run) for run in runs]
-            for item_index, _ in callable_items
+            [min(_point_run_distance(_center(items[peer].box_px), run) for peer in group) for run in runs]
+            for group in groups
         ]
     )
     # A penalty cell must cost more than a whole fully in-gate assignment can
@@ -546,13 +655,14 @@ def bind_calls(
         distance = float(distances[row, col])
         if distance > gate:
             continue  # every candidate run for this item was out of gate
-        item_index, call = callable_items[row]
-        bound.append(BoundCall(call=call, run=runs[col], item=items[item_index], distance_px=distance))
-        bound_item_indices.add(item_index)
+        call = calls[row]
+        representative = groups[row][0]
+        bound.append(BoundCall(call=call, run=runs[col], item=items[representative], distance_px=distance))
+        bound_item_indices.add(representative)
 
     # row_index is sorted ascending (scipy guarantees this), and rows follow
-    # callable_items' -- hence items' -- own order, so this needs no extra
-    # sort to stay deterministic (A8).
+    # ``calls``' -- hence items' -- own order, so this needs no extra sort to
+    # stay deterministic (A8).
     unbound = [
         item for index, item in enumerate(items) if index not in bound_item_indices and index not in merged_item_indices
     ]

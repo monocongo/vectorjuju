@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Acceptance-suite overlays (CI uploads them; nothing binary is committed)
+artifacts/
